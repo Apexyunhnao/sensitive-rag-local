@@ -1,0 +1,25 @@
+# 凭据与运行时状态（绝不提交）
+.dify-auth.json
+.dify-tiered.json
+.dify-dataset-key.txt
+*.key
+*.pem
+.env
+
+# 运行时产物
+out/*
+!out/facts/
+!out/facts/**
+models/
+*.blob
+parts/
+.venv/
+__pycache__/
+*.pyc
+.guardrag_storage/
+
+# 备份
+*.bak-*
+
+# 真实公告 PDF 原件（港交所公开文件，仓库只放解析结果与来源 URL）
+data/real_hkex/*.pdf
