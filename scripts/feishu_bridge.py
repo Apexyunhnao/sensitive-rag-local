@@ -92,10 +92,13 @@ REVOKED_FILE = OUT / "feishu_revoked.json"
 
 
 def load_local_users() -> dict:
+    """读 open_id 名册。以 `_` 开头的键当注释忽略（防止有人写 "_说明" 进来）。"""
     if USERS_FILE.exists():
         try:
-            return json.loads(USERS_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            raw = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+            return {k: v for k, v in raw.items()
+                    if isinstance(v, dict) and not k.startswith("_")}
+        except (json.JSONDecodeError, AttributeError):
             pass
     USERS_FILE.write_text(json.dumps(DEFAULT_USERS, ensure_ascii=False, indent=2), encoding="utf-8")
     return DEFAULT_USERS
@@ -210,6 +213,25 @@ class FeishuClient:
 
 CLIENT = FeishuClient() if not MOCK else None
 LOCAL_USERS = load_local_users()
+_USERS_CACHE: dict = {"mtime": 0.0, "data": LOCAL_USERS}
+
+
+def local_users() -> dict:
+    """open_id → {name, groups} 的本地映射，改文件即时生效（按 mtime 判断）。
+
+    小公司常见情况：所有人挂在根部门 '0'，部门映射永远查不到东西。
+    这时按 open_id 精确指定密级是唯一可行的办法。
+    """
+    try:
+        m = USERS_FILE.stat().st_mtime
+    except OSError:
+        return LOCAL_USERS
+    if m != _USERS_CACHE["mtime"]:
+        _USERS_CACHE["data"] = load_local_users()
+        _USERS_CACHE["mtime"] = m
+    return _USERS_CACHE["data"]
+
+
 TASKS: "queue.Queue[dict]" = queue.Queue()
 
 
@@ -217,27 +239,38 @@ def resolve_identity(open_id: str) -> tuple[str, list[str], str]:
     """open_id → (显示名, 密级组列表, 错误说明)。
 
     绝不从消息体里读部门：员工能改的字段一律不参与权限判断。
+
+    三段优先级：
+      1. open_id 精确映射（out/feishu_users.json）—— 覆盖一切，也用于扁平组织
+      2. 部门映射（out/feishu_depmap.json）—— 组织架构规范时的正路
+      3. 都没有 → 拒绝并说清原因（不猜、不给默认权限）
     """
     if open_id in load_revoked():
         return "", [], "账号已离职，权限已吊销"
+
+    # 1. open_id 精确映射
+    u = local_users().get(open_id)
+    if u:
+        return u.get("name", open_id[:10]), list(u.get("groups", [])), ""
+
     if MOCK:
-        u = LOCAL_USERS.get(open_id)
-        if not u:
-            return "", [], "不在员工名册（mock）"
-        return u.get("name", open_id), list(u.get("groups", [])), ""
+        return "", [], "不在员工名册（mock）"
+
+    # 2. 部门映射
     try:
         deps = CLIENT.user_departments(open_id)  # type: ignore[union-attr]
     except Exception as e:  # noqa: BLE001
         return "", [], f"查通讯录失败: {e}"
     if not deps:
         return "", [], "该用户没有部门归属"
-    # 部门 id → 密级组 的映射表（接真环境时按公司组织架构填）
     dep_map = _load_dep_map()
     groups: list[str] = []
     for dep in deps:
         groups.extend(dep_map.get(dep, []))
     if not groups:
-        return open_id[:10], [], f"部门 {deps} 未映射到任何密级"
+        # 根部门 '0' 是典型情况：全员挂在根上，按部门无法区分密级
+        hint = "（全员都在根部门，请改用 open_id 映射）" if deps == ["0"] else ""
+        return open_id[:10], [], f"部门 {deps} 未映射到任何密级{hint}"
     return open_id[:10], sorted(set(groups)), ""
 
 
@@ -547,7 +580,10 @@ def selftest() -> int:
     import subprocess
     import tempfile
 
-    global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN
+    global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN, MOCK, CLIENT
+    # 自测一律走 mock：.env 里一旦填了真实凭据，不强制就会去真调飞书 API（实测踩过）
+    MOCK = True
+    CLIENT = None
     VERIFY_TOKEN = "selftest-token"      # 自测里必须真的走 token 校验分支
     tmp = Path(tempfile.mkdtemp(prefix="feishu_selftest_"))
     DB, REPLY_LOG = tmp / "bridge.db", tmp / "replies.jsonl"
