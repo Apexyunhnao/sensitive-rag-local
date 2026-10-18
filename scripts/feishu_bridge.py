@@ -16,9 +16,11 @@
   real：需要 FEISHU_APP_ID / FEISHU_APP_SECRET，走飞书开放平台 open.feishu.cn
 
 用法：
-  python scripts/feishu_bridge.py --selftest        # 端到端自测（不需要飞书凭据）
-  python scripts/feishu_bridge.py --port 8091       # 起服务
-  python scripts/feishu_bridge.py --load            # 只看身份映射和配置状态
+  .venv/Scripts/python.exe scripts/feishu_bridge.py --selftest   # 端到端自测（不需要凭据）
+  .venv/Scripts/python.exe scripts/feishu_bridge.py --port 8091  # 起服务
+  .venv/Scripts/python.exe scripts/feishu_bridge.py --load       # 只看身份映射和配置状态
+  ⚠️ 必须用项目 .venv 解释器：图片链路依赖 RapidOCR，系统 python 没装
+     （2026-10-19 实测：用系统 python3 跑自测会报 10 项假失败）
 
 飞书后台配置（接真环境时）：
   事件订阅地址 → http://<内网地址>:8091/feishu/event
@@ -1037,6 +1039,16 @@ def serve(port: int) -> None:
 def selftest() -> int:
     import subprocess
     import tempfile
+
+    # ⚠️ 前置检查：图片用例依赖本地 RapidOCR（只装在项目 .venv）。
+    #    缺引擎时图片相关 10 项会假失败，看起来像代码坏了 —— 这里直接说清是环境问题。
+    #    （2026-10-19 实测：系统 python3 跑出 25/35，换 .venv 后 35/35）
+    try:
+        ocr_engine()
+    except Exception as e:  # noqa: BLE001
+        print(f"\n❌ 自测前置检查失败：{e}")
+        print("   正确跑法：.venv/Scripts/python.exe scripts/feishu_bridge.py --selftest")
+        return 2
 
     global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN, MOCK, CLIENT, ingest, call_llm
     # 自测一律走 mock：.env 里一旦填了真实凭据，不强制就会去真调飞书 API（实测踩过）
