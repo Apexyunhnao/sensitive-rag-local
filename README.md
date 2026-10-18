@@ -280,7 +280,7 @@ py scripts/deploy.py --verify
 # 5. 真实公告解析
 py scripts/pdf_to_md.py data/real_hkex/*.pdf
 
-# 6. 飞书接入层（mock 模式，无需凭据；19 项自测，含图片入库与撤销）
+# 6. 飞书接入层（mock 模式，无需凭据；23 项自测，含图片识别/入库/撤销/就图提问）
 py scripts/feishu_bridge.py --selftest   # 23 项
 py scripts/feishu_bridge.py --port 8091    # HTTP 回调模式
 py scripts/feishu_bridge.py --ws           # 长连接模式（真环境用这个）
