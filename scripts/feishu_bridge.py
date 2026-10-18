@@ -599,21 +599,132 @@ def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
     reply_and_log(open_id, message_id, name, event_id, t0, body, tier)
 
 
+FILE_TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".log"}
+FILE_PDF_EXTS = {".pdf"}
+
+
+def mock_file(suffix: str) -> Path:
+    """mock 模式下没有真文件可下载，造一份样例顶替，好把「下载→解析→待入库」跑通。"""
+    if suffix in FILE_PDF_EXTS:
+        sample = OUT / "mock_announcement.pdf"
+        if not sample.exists():
+            import pymupdf
+            doc = pymupdf.open()
+            page = doc.new_page()
+            page.insert_text((72, 90), "Continuing Connected Transaction", fontsize=14)
+            page.insert_text((72, 120), "Proposed annual cap for the year ending 2026:", fontsize=11)
+            page.insert_text((72, 140), "Property services  RMB 363 million", fontsize=11)
+            page.insert_text((72, 160), "Equipment lease  RMB 4747 million", fontsize=11)
+            doc.save(str(sample))
+        return sample
+    sample = OUT / "mock_notice.txt"
+    if not sample.exists():
+        sample.write_text(
+            "关于关联交易审批的提示\n\n"
+            "合规部提示：上市公司与关联方之间的交易，须按《上市规则》第 14A 章履行申报、公告及独立股东批准程序。\n"
+            "本季度内审发现 3 笔关联交易未在董事会决议前完成事前审批，须补正。\n",
+            encoding="utf-8")
+    return sample
+
+
+def extract_file_text(path: Path) -> str:
+    """文件 → 纯文本。PDF 走 pdf_to_md（按坐标重建表格），其余按文本读。"""
+    if path.suffix.lower() in FILE_PDF_EXTS:
+        import pdf_to_md                    # 延迟导入：非 PDF 场景不需要 pymupdf
+        return pdf_to_md.extract(path)
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def handle_file(task: dict, name: str, groups: list[str], t0: float) -> None:
+    """文件消息 → 下载 → 解析成文本 → 回摘要，**默认不写库**（与图片同一套确认逻辑）。
+
+    与图片的区别：文件已经有文字层，不需要 OCR；扫描件 PDF 提不到字会明确提示改用拍照。
+    """
+    event_id, open_id, message_id = task["event_id"], task["open_id"], task["message_id"]
+    content = task.get("content") or {}
+    file_key = content.get("file_key", "")
+    file_name = content.get("file_name") or content.get("name") or ""
+    if not file_key:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "这份文件没取到内容（缺 file_key），重发一次试试。", blocked=True)
+        return
+
+    suffix = Path(file_name).suffix.lower()
+    if suffix not in FILE_TEXT_EXTS | FILE_PDF_EXTS:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"暂不支持 {suffix or '这种'} 格式。目前能读 PDF / TXT / MD / CSV；"
+                      f"Word / Excel 请先另存为 PDF 再发。", blocked=True)
+        return
+
+    tiers = tiers_for_groups(groups)
+    if not tiers:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"{name}，你没有可写入的知识库，只能解析不能入库。", blocked=True)
+        return
+    tier = tiers[0]
+
+    # 1. 下载（文件资源走 type=file）
+    try:
+        if MOCK:
+            path = mock_file(suffix)
+        else:
+            safe = re.sub(r"[^\w.\-]", "_", file_name)[:80] or f"file{suffix}"
+            path = UPLOADS / f"{message_id}-{safe}"
+            path.write_bytes(CLIENT.download_resource(message_id, file_key, "file"))
+    except Exception as e:  # noqa: BLE001
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"下载文件失败：{e}", blocked=True)
+        return
+
+    # 2. 解析（本地，不出网）
+    try:
+        text = extract_file_text(path)
+    except Exception as e:  # noqa: BLE001
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"解析失败：{e}", blocked=True)
+        return
+    if not text.strip():
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "没提取到文字（可能是扫描件）。这类请直接用相机拍下来发我 OCR。",
+                      blocked=True)
+        return
+
+    # 3. 存为「仅识别」状态：等用户决定入库还是提问
+    raw_name = Path(file_name).stem if file_name else message_id
+    doc_name = f"飞书文件-{name.replace('（', '-').replace('）', '')}-{raw_name}-" \
+               f"{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    token = hashlib.sha256(f"{message_id}{time.time()}".encode()).hexdigest()[:16]
+    pending_save(token, open_id, name, tier, doc_name, text, 1.0, "ocr_only")
+
+    body = (f"已读《{file_name or doc_name}》，提取到 {len(text)} 字。\n\n"
+            f"摘要：\n{text[:280]}" + ("…" if len(text) > 280 else "") +
+            f"\n\n要怎么处理？\n"
+            f"· 回「入库」→ 写进「{tier}」\n"
+            f"· 直接问 → 我按这份文件的内容回答（例如「金额上限是多少」）\n"
+            f"（5 分钟内有效）")
+    reply_and_log(open_id, message_id, name, event_id, t0, body, tier)
+
+
+def _kind_word(p: dict) -> str:
+    """给用户看的指代：文件 / 图片（同一套待入库记录，文案要说对）。"""
+    return "这份文件" if str(p.get("doc_name", "")).startswith("飞书文件-") else "这张图"
+
+
 def handle_confirm(open_id: str, message_id: str, name: str, event_id: str, t0: float) -> None:
     p = pending_latest(open_id, ("ocr_only", "awaiting", "ingested", "revoked"))
     if not p or time.time() - p["ts"] > UNDO_WINDOW:
         reply_and_log(open_id, message_id, name, event_id, t0,
-                      "没有待入库的内容（5 分钟内有效）。请先发一张图片。", blocked=True)
+                      "没有待入库的内容（5 分钟内有效）。请先发一张图片或一份文件。", blocked=True)
         return
     if p["status"] == "ingested":
         reply_and_log(open_id, message_id, name, event_id, t0,
-                      f"这张图已经在「{p['tier']}」里了（{p['doc_name']}）。\n"
+                      f"{_kind_word(p)}已经在「{p['tier']}」里了（{p['doc_name']}）。\n"
                       f"重复写入只会让库里多一条重复内容，所以没有再加。\n"
-                      f"要存新的一张请重新发图。", blocked=True)
+                      f"要存新的请重新发一次。", blocked=True)
         return
     if p["status"] == "revoked":
         reply_and_log(open_id, message_id, name, event_id, t0,
-                      "这张图刚才被撤销了。要重新入库请再发一次图片。", blocked=True)
+                      f"{_kind_word(p)}刚才被撤销了。要重新入库请再发一次。", blocked=True)
         return
     if ingest is None:
         reply_and_log(open_id, message_id, name, event_id, t0,
@@ -672,6 +783,9 @@ def handle_task(task: dict) -> None:
     if msg_type == "image":
         handle_image(task, name, groups, t0)
         return
+    if msg_type == "file":
+        handle_file(task, name, groups, t0)
+        return
 
     if text in CONFIRM_WORDS:
         handle_confirm(open_id, message_id, name, event_id, t0)
@@ -685,7 +799,7 @@ def handle_task(task: dict) -> None:
 
     if not text:
         reply_and_log(open_id, message_id, name, event_id, t0,
-                      "直接问问题，或者发一张照片让我识别入库。", blocked=True)
+                      "直接问问题，或者发一张照片 / 一份 PDF 让我读进来。", blocked=True)
         return
 
     # 刚发过图、接着问了句话 → 按那张图回答（不走知识库）
@@ -696,7 +810,7 @@ def handle_task(task: dict) -> None:
         ok, ans = call_llm(text, img["text"])
         if ok:
             reply_and_log(open_id, message_id, name, event_id, t0,
-                          f"{name}，按你刚发的那张图：\n\n{ans}\n\n"
+                          f"{name}，按你刚发的{_kind_word(img)}：\n\n{ans}\n\n"
                           f"（要把它存进「{img['tier']}」就回「入库」）", img["tier"])
         else:
             reply_and_log(open_id, message_id, name, event_id, t0, ans, blocked=True)
@@ -1097,7 +1211,7 @@ def selftest() -> int:
     post(msg_event("ev_ask_1", "ou_mock_zhang", "上面的出生日期是多少", mid="om_ask_1"))
     wait_replies(base_n + 1, 120)
     r11 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
-    check("走的是按图回答", "按你刚发的那张图" in r11, r11.replace("\n", " ")[:110])
+    check("走的是按图回答", "按你刚发的" in r11 and "图" in r11, r11.replace("\n", " ")[:110])
     check("没有把图写进库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
     print("\n== 12. 离职用户发图被拒（不留后门）==")
@@ -1128,8 +1242,43 @@ def selftest() -> int:
     post(msg_event("ev_ask_2", "ou_mock_zhang", "刚刚识别的图片", mid="om_ask_2"))
     wait_replies(base_n + 1, 120)
     r14 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
-    check("撤销后仍按图回答", "按你刚发的那张图" in r14, r14.replace("\n", " ")[:120])
+    check("撤销后仍按图回答", "按你刚发的" in r14 and "图" in r14, r14.replace("\n", " ")[:120])
     check("撤销后没偷偷写回库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+
+    print("\n== 15. 发 PDF → 解析出文本，但**不自动入库** ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_file_1", "ou_mock_zhang", "", mid="om_file_1",
+                   msg_type="file",
+                   content={"file_key": "file_fake_1", "file_name": "公告.pdf"}))
+    wait_replies(base_n + 1, 200)
+    r15 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("解析出正文内容", "annual cap" in r15.lower() or "363" in r15,
+          r15.replace("\n", " ")[:120])
+    check("问了要怎么处理", "要怎么处理" in r15, r15.replace("\n", " ")[-90:])
+    check("没有自动写库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+
+    print("\n== 16. 回「入库」→ 文件写进库，撤销后删掉 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_file_ingest", "ou_mock_zhang", "入库", mid="om_file_ingest"))
+    wait_replies(base_n + 1, 60)
+    r16 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("文件写入成功", "已写入" in r16, r16.replace("\n", " ")[:110])
+    check("假库里有 1 条", len(FAKE.docs) == 1, f"{len(FAKE.docs)} 条")
+    base_n = len(read_replies())
+    post(msg_event("ev_file_revoke", "ou_mock_zhang", "撤销", mid="om_file_revoke"))
+    wait_replies(base_n + 1, 60)
+    check("文件可撤销、库清空", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+
+    print("\n== 17. 不支持的格式被明确拒绝 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_file_bad", "ou_mock_zhang", "", mid="om_file_bad",
+                   msg_type="file",
+                   content={"file_key": "file_fake_2", "file_name": "合同.docx"}))
+    wait_replies(base_n + 1, 60)
+    r17 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("提示暂不支持并给出替代", "暂不支持" in r17 and "PDF" in r17,
+          r17.replace("\n", " ")[:110])
+    check("没有写进任何库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
     srv.shutdown()
     print("\n" + "=" * 60)

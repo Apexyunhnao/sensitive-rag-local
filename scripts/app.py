@@ -280,6 +280,64 @@ def _week_ago() -> str:
     return (_dt.datetime.now() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
 
 
+# —— Agent 能力演示：本地自愈 agent ——
+# 直接跑 self-healing-agent 的 demo_cycle.py（探针→故障注入→修复→验证→清理），
+# 把它的 stdout 解析成分步时间线返回给界面。不伪造：拿不到真实输出就报错。
+SELF_HEAL_DIR = Path(os.getenv("SELF_HEAL_DIR", r"E:\Projects\self-healing-agent"))
+
+
+def _parse_heal_output(text: str) -> list[dict]:
+    """把 demo_cycle.py 的输出切成 [{'title': '1. …', 'lines': [...]}, …]。"""
+    steps: list[dict] = []
+    cur: dict | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("===") and line.endswith("==="):
+            title = line.strip("= ").strip()
+            cur = {"title": title, "lines": []}
+            steps.append(cur)
+            continue
+        if cur is None:
+            cur = {"title": "输出", "lines": []}
+            steps.append(cur)
+        cur["lines"].append(line)
+    return steps
+
+
+@app.post("/api/agent/heal")
+def agent_heal() -> JSONResponse:
+    """真跑一次自愈闭环演示（约 10–30 秒）。"""
+    script = SELF_HEAL_DIR / "demo_cycle.py"
+    if not script.exists():
+        return JSONResponse({"ok": False, "error": f"找不到 {script}"}, status_code=404)
+    t0 = time.time()
+    try:
+        out = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(SELF_HEAL_DIR), capture_output=True, text=True,
+            timeout=180, encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"ok": False, "error": "自愈演示超时（180 秒）"}, status_code=504)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"启动失败：{e}"}, status_code=500)
+
+    stdout = out.stdout or ""
+    success = "集成闭环: 成功" in stdout
+    return JSONResponse({
+        "ok": out.returncode == 0 and success,
+        "success": success,
+        "returncode": out.returncode,
+        "elapsed_ms": round((time.time() - t0) * 1000),
+        "steps": _parse_heal_output(stdout),
+        "stderr": (out.stderr or "")[-1500:],
+        "raw": stdout[-4000:],
+    })
+
+
+
 @app.get("/api/projects")
 def projects() -> dict:
     """列出项目目录下的所有项目及其真实状态（git 分支/最后提交/未提交数）。
