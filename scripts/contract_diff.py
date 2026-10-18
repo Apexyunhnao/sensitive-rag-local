@@ -128,18 +128,55 @@ def pair_clauses(a: list[dict], b: list[dict]) -> tuple[list[tuple[int, int, str
 
     used_a: set[int] = set()
     used_b: set[int] = set()
-    pairs: list[tuple[int, int, str]] = []
+    pairs: list[tuple[int, int, float]] = []
     for score, i, j in cand:
         if score < 0.55:
             break
         if i in used_a or j in used_b:
             continue
-        pairs.append((i, j, f"相似 {min(score, 1.0):.2f}"))
+        pairs.append((i, j, min(score, 1.0)))
         used_a.add(i)
         used_b.add(j)
 
     pairs.sort()
     return pairs, [j for j in range(len(b)) if j not in used_b], [i for i in range(len(a)) if i not in used_a]
+
+
+def sanity(text_a: str, text_b: str, a: list[dict], b: list[dict], changes: list[dict]) -> list[str]:
+    """让工具自证：我看到了什么、哪里是在猜。
+
+    「保证不会错」在工程上做不到，但可以做到「错了你看得见」：
+    不确定的地方一律报警，绝不静默地猜一个结果给你。
+    """
+    warns: list[str] = []
+
+    la, lb = len(text_a.strip()), len(text_b.strip())
+    if la and lb:
+        r = lb / la
+        if r < 0.6 or r > 1.7:
+            warns.append(
+                f"内容量异常：A {la} 字 / B {lb} 字（{r:.2f} 倍）。"
+                f"可能有一版没解析全（扫描件、跨页、图片型 PDF），先确认再信下面的结果。")
+
+    na, nb = len(a), len(b)
+    if max(na, nb) and abs(na - nb) > max(na, nb) * 0.5:
+        warns.append(f"条款数差异过大：A {na} 条 / B {nb} 条。"
+                     f"可能是条款编号格式不同导致切分不一致，请人工看一眼原文件。")
+
+    low = [c for c in changes
+           if c.get("score") is not None and c["score"] < 0.75 and c["type"] == "修改"]
+    if low:
+        names = "、".join((c["clause"] or c["clause_old"]) for c in low[:5])
+        warns.append(f"{len(low)} 处条款配对是「猜」的（相似度低于 0.75）：{names}。"
+                     f"可能把两条不相干的条款对到一起了，请重点核对这几条。")
+
+    added = [c for c in changes if c["type"] == "新增"]
+    removed = [c for c in changes if c["type"] == "删除"]
+    if len(added) + len(removed) > 3:
+        warns.append(f"新增 {len(added)} 条 + 删除 {len(removed)} 条，数量偏多。"
+                     f"真实合同一次不会改这么多条，更可能是解析或切分问题（例如一版是扫描件）。")
+
+    return warns
 
 
 # ---------------------------------------------------------------- 字段标注
@@ -261,8 +298,9 @@ def compare_text(text_a: str, text_b: str) -> dict:
 
     changes: list[dict] = []
 
-    for i, j, how in pairs:
+    for i, j, score in pairs:
         ca, cb = a[i], b[j]
+        how = f"相似 {score:.2f}"
         # 正文（不含标题）比较：标题里的「第4条→第5条」是重新编号，不是内容改动，
         # 混在一起会让每一条都被判成「修改」（实测踩过）
         body_a = "\n".join(ca["body"])
@@ -273,7 +311,7 @@ def compare_text(text_a: str, text_b: str) -> dict:
                 changes.append({
                     "clause": cb["id"], "clause_old": ca["id"],
                     "title": cb["title"][:80], "type": "仅编号变更", "matched_by": how,
-                    "critical": False, "tags": ["编号"],
+                    "score": score, "pos": j, "critical": False, "tags": ["编号"],
                     "diffs": [{"kind": "renumber", "old": ca["id"], "new": cb["id"],
                                "context": "", "tags": ["编号"], "critical": False}],
                 })
@@ -291,6 +329,8 @@ def compare_text(text_a: str, text_b: str) -> dict:
             "title": cb["title"][:80],
             "type": "修改",
             "matched_by": how,
+            "score": score,
+            "pos": j,
             "critical": bool(fields) or any(d["critical"] for d in diffs),
             "tags": sorted({t for d in diffs for t in d["tags"]} | {f["field"] for f in fields}),
             "fields": fields,
@@ -300,7 +340,7 @@ def compare_text(text_a: str, text_b: str) -> dict:
     for j in added:
         changes.append({
             "clause": b[j]["id"], "clause_old": "", "title": b[j]["title"][:80],
-            "type": "新增", "matched_by": "—", "critical": True,
+            "type": "新增", "matched_by": "—", "critical": True, "pos": j,
             "tags": tag_change("", b[j]["text"]),
             "diffs": [{"kind": "insert", "old": "", "new": b[j]["text"][:400],
                        "context": "", "tags": tag_change("", b[j]["text"]),
@@ -310,26 +350,32 @@ def compare_text(text_a: str, text_b: str) -> dict:
     for i in removed:
         changes.append({
             "clause": "", "clause_old": a[i]["id"], "title": a[i]["title"][:80],
-            "type": "删除", "matched_by": "—", "critical": True,
+            "type": "删除", "matched_by": "—", "critical": True, "pos": i + 0.5,
             "tags": tag_change(a[i]["text"], ""),
             "diffs": [{"kind": "delete", "old": a[i]["text"][:400], "new": "",
                        "context": "", "tags": tag_change(a[i]["text"], ""),
                        "critical": True}],
         })
 
-    # 关键变更排前面，其次按条款顺序
-    changes.sort(key=lambda c: (not c["critical"], c["clause"] or "zzz"))
+    # 按条款在 B 版里的顺序排（法务是顺着合同核对，不是按关键词扫）；
+    # 关键变更用【关键】标出来，不靠排序抢位置
+    changes.sort(key=lambda c: c.get("pos", 9999))
+
+    content_changes = [c for c in changes if c["type"] != "仅编号变更"]
+    renumbered = [c for c in changes if c["type"] == "仅编号变更"]
 
     return {
         "summary": {
             "clauses_a": len(a),
             "clauses_b": len(b),
-            "changed": len(changes),
-            "critical": sum(1 for c in changes if c["critical"]),
+            "changed": len(content_changes),
+            "critical": sum(1 for c in content_changes if c["critical"]),
             "added": len(added),
             "removed": len(removed),
-            "modified": len(changes) - len(added) - len(removed),
+            "modified": len(content_changes) - len(added) - len(removed),
+            "renumbered": len(renumbered),
         },
+        "warnings": sanity(text_a, text_b, a, b, content_changes),
         "changes": changes,
     }
 
@@ -339,10 +385,21 @@ def render(result: dict, title: str = "合同比对") -> str:
     lines = [
         f"=== {title} ===",
         f"条款数：A {s['clauses_a']} 条 / B {s['clauses_b']} 条",
-        f"改动：{s['changed']} 处（关键 {s['critical']}）"
+        f"内容改动：{s['changed']} 处（关键 {s['critical']}）"
         f"  修改 {s['modified']} · 新增 {s['added']} · 删除 {s['removed']}",
-        "",
     ]
+    if s.get("renumbered"):
+        lines.append(f"另有 {s['renumbered']} 处仅条款编号变化（内容未变，通常是插入了新条款导致后面顺移）")
+    lines.append("")
+
+    # 自检报警放最前面：这些是「工具没把握」的地方，必须先看到
+    warns = result.get("warnings") or []
+    if warns:
+        lines.append("⚠ 需要人工确认的地方：")
+        for w in warns:
+            lines.append(f"  · {w}")
+        lines.append("")
+
     if not result["changes"]:
         lines.append("两份文件在整个条款层面没有差异。")
         return "\n".join(lines)
