@@ -38,7 +38,7 @@ def make_id_card(path: Path, name="林嘉欣", idnum="44030419900307123X") -> No
 
     rows = [
         ("姓    名", name),
-        ("性    别", "女        民 族  汉"),
+        ("性    别", "男        民 族  汉"),
         ("出    生", "1990 年 3 月 7 日"),
         ("住    址", "广东省深圳市南山区科技园路 88 号 3 栋 1201"),
         ("公民身份号码", idnum),
@@ -67,6 +67,32 @@ def validate(num: str) -> tuple[bool, str]:
     if check_digit(num[:17]) != num[17]:
         return False, "校验位不匹配"
     return True, "通过"
+
+
+def extract_name(lines: list[str]) -> str:
+    """取「姓名」标签后紧跟的文字段。
+
+    OCR 会把标签列和值列拆成两段（如「姓名」/「林嘉欣」），
+    不能直接用"第一行第一段中文"——那是「中华人民共和国」。
+    """
+    NOISE = {"中华人民共和国", "居民身份证", "姓名", "性别", "民族", "出生", "住址", "公民身份号码"}
+    for i, raw in enumerate(lines):
+        label = re.sub(r"\s", "", raw)
+        if label in {"姓名"} or label.startswith("姓名"):
+            for nxt in lines[i + 1:]:
+                cand = nxt.strip()
+                if not cand or re.sub(r"\s", "", cand) in NOISE:
+                    continue
+                if re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", cand):
+                    return cand
+                break
+    # 兜底：排除标题/标签后取第一个 2-6 字纯中文段
+    for raw in lines:
+        cand = raw.strip()
+        if cand in NOISE or not re.fullmatch(r"[\u4e00-\u9fa5·]{2,6}", cand):
+            continue
+        return cand
+    return "未识别"
 
 
 def main() -> None:
@@ -110,8 +136,7 @@ def main() -> None:
     else:
         print("未找到 18 位身份证号（可能被空格/换行断开）")
 
-    m2 = re.search(r"[\u4e00-\u9fa5]{2,4}", full.split("\n")[0] if lines else "")
-    print(f"姓名候选: {m2.group(0) if m2 else '未识别'}")
+    print(f"姓名: {extract_name(lines)}")
     print(f"\n全程耗时: {(time.time()-t0)*1000:.0f} ms，零网络请求")
 
 
