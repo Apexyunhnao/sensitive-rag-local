@@ -201,6 +201,38 @@ python scripts/feishu_probe.py --phone 138xxx  # 顺带验证「手机号 → de
 { "od-xxxxxxxxxxxxxxxx": ["compliance"], "od-yyyyyyyyyyyyyyyy": ["hr"] }
 ```
 
+> 实测补充：小租户常常**所有人都在根部门 `0`**，按部门根本分不出密级。
+> 这种情况用 `out/feishu_users.json` 按 open_id 精确指定，优先级高于部门映射（改文件即时生效，不用重启）。
+
+### 员工发图片：识别 → 判定 → 入库 → 可撤销
+
+```
+员工在飞书发一张照片
+   → 下载（im:resource 权限）→ 存 out/uploads/
+   → RapidOCR 本地识别（不出网）→ 抽字段（身份证号走 GB11643 校验位）
+   → 按置信度分三档：
+        ≥0.95 且校验通过  → 直接入库 + 回「已写入，5 分钟内回『撤销』可删」
+        0.70~0.95 或校验失败 → 回预览 + 「确认」/「取消」
+        <0.70            → 「没认清，请靠近对准重拍」
+   → 确认/撤销都靠回文字，不需要卡片权限
+```
+
+为什么不全自动、也不全人工：全自动会把 OCR 错误变成**所有人都会检索到的错答案**；
+全人工员工嫌烦，最后就绕过系统。所以只在「不确定」的时候才拦人。
+
+实测（`--selftest` 第 8–10 项，假写入模块，不碰真库）：
+
+```
+[PASS] 识别出身份证号       44030419900307123X，置信度 1.00，13 段文字
+[PASS] 校验位通过           1990-03-07 / 男（从号码反推，不用信图上的字）
+[PASS] 高置信度自动入库     假库 1 条
+[PASS] 撤销成功             已从「合规知识库」删除该文档，假库清空
+[PASS] 离职用户不能上传      权限吊销优先于任何入库动作
+```
+
+写入链路单独验证过（真写一条再删掉）：`py scripts/dify_ingest.py --selftest` → 6 项全过、
+文档数 2 → 3 → 2。
+
 ---
 
 ## 架构
@@ -221,24 +253,32 @@ Ollama qwen2.5:7b（对话） + bge-m3（向量）  ← 全部本机，零外发
 ## 快速开始
 
 ```bash
+# ⚠️ 全部命令都要用项目 .venv 的解释器：系统 python 没装 OCR 和 lark-oapi，
+#    用错解释器时文字问答照样正常，只有发图才报错 —— 很难发现
+alias py=".venv/Scripts/python.exe"     # PowerShell / cmd 用 .venv\Scripts\python.exe
+
 # 1. 前置检查（Docker / Ollama / 模型 / Dify 是否就绪）
-python scripts/deploy.py --check --offline
+py scripts/deploy.py --check --offline
 
 # 2. 建库 + 建应用（按密级）
-python scripts/dify_tiered2.py
+py scripts/dify_tiered2.py
 
 # 3. 起权限网关
-python scripts/gateway.py
+py scripts/gateway.py
 
 # 4. 端到端验证（5 项，含 401/403）
-python scripts/deploy.py --verify
+py scripts/deploy.py --verify
 
 # 5. 真实公告解析
-python scripts/pdf_to_md.py data/real_hkex/*.pdf
+py scripts/pdf_to_md.py data/real_hkex/*.pdf
 
-# 6. 飞书接入层（mock 模式，无需凭据；11 项自测）
-python scripts/feishu_bridge.py --selftest
-python scripts/feishu_bridge.py --port 8091    # 起服务
+# 6. 飞书接入层（mock 模式，无需凭据；19 项自测，含图片入库与撤销）
+py scripts/feishu_bridge.py --selftest
+py scripts/feishu_bridge.py --port 8091    # HTTP 回调模式
+py scripts/feishu_bridge.py --ws           # 长连接模式（真环境用这个）
+
+# 7. 知识库写入链路自测（会真写一条再删掉，验证 create-by-text 与撤销）
+py scripts/dify_ingest.py --selftest
 ```
 
 ## 已知限制
@@ -247,8 +287,9 @@ python scripts/feishu_bridge.py --port 8091    # 起服务
 解析     pdf_to_md.py 只处理「空白对齐 + 两行表头」的表格
         有框线、合并单元格、跨页表格处理不了
         生产环境应先用 MinerU 之类做版面分析
-飞书     只有 mock 模式跑通；真实飞书未接（缺 app_secret 与事件订阅地址）
-        图片/文件消息、确认卡片、部门 id→密级 的映射表都还没做
+飞书     文字问答 + 图片入库已通真环境；**文件（PDF/Word）消息还没做**
+        确认走文字回复，没用卡片（卡片要额外 cardkit 权限）
+        小租户全员在根部门 '0' 时只能靠 open_id 映射，组织架构变了要手工维护
 权限     用户表是硬编码的，没接 AD/LDAP
         密级超过 5 个时，库数量膨胀，维护成本会爆
 并发     没测。7B 单卡大概只能 3-5 人同时用

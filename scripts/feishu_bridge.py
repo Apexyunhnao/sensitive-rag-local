@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import sqlite3
 import sys
 import threading
@@ -41,9 +42,17 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import dify_ingest as ingest          # 写入/撤销 Dify 知识库
+except ImportError:                       # 单独跑时允许缺失，图片入库会报错
+    ingest = None
+
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "out"
 OUT.mkdir(exist_ok=True)
+UPLOADS = OUT / "uploads"
+UPLOADS.mkdir(exist_ok=True)
 DB = OUT / "feishu_bridge.db"
 USERS_FILE = OUT / "feishu_users.json"
 REPLY_LOG = OUT / "feishu_replies.jsonl"
@@ -129,6 +138,11 @@ def db_init() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, event_id TEXT,
             open_id TEXT, user_name TEXT, tier TEXT, blocked INTEGER,
             latency_ms INTEGER, answer_len INTEGER, error TEXT)""")
+        # 待确认的图片上传：token 让「确认/取消/撤销」能对上具体内容
+        c.execute("""CREATE TABLE IF NOT EXISTS pending (
+            token TEXT PRIMARY KEY, ts REAL, open_id TEXT, user_name TEXT,
+            tier TEXT, doc_name TEXT, text TEXT, confidence REAL,
+            doc_id TEXT, status TEXT)""")
 
 
 def claim_event(event_id: str, open_id: str, kind: str) -> bool:
@@ -207,6 +221,19 @@ class FeishuClient:
         return self._post(
             f"/open-apis/im/v1/messages/{message_id}/reply",
             {"msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)})
+
+    def download_resource(self, message_id: str, file_key: str,
+                          rtype: str = "image") -> bytes:
+        """下载消息里的图片/文件（需要 im:resource 权限）。
+
+        rtype: image | file
+        """
+        req = urllib.request.Request(
+            f"{FEISHU_BASE}/open-apis/im/v1/messages/{message_id}/resources/"
+            f"{file_key}?type={rtype}",
+            headers={"Authorization": f"Bearer {self.tenant_token()}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
 
 
 # ── 核心处理 ────────────────────────────────────────────────────────────────
@@ -305,6 +332,139 @@ def call_gateway(groups: list[str], question: str) -> tuple[int, dict]:
         return 0, {"error": f"网关不可达: {e}"}
 
 
+CONFIRM_WORDS = {"确认", "确定", "是", "入库", "ok", "OK", "好"}
+CANCEL_WORDS = {"取消", "不要", "放弃", "算了"}
+REVOKE_WORDS = {"撤销", "撤回", "删除"}
+CONF_AUTO = 0.95      # 高于这个且校验通过 → 直接入库（可撤销）
+CONF_MIN = 0.70       # 低于这个 → 让人重拍
+UNDO_WINDOW = 300     # 秒：确认/撤销的有效期
+
+WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+CHECK = "10X98765432"
+ID_RE = re.compile(r"(?<!\d)(\d{17}[\dXx])(?!\d)")
+_OCR_ENGINE = None
+
+
+def ocr_engine():
+    """RapidOCR 引擎单例（每次 new 要 1 秒，问一次图就 new 一次太浪费）。
+
+    注意：必须用项目 .venv 的 python 跑，系统 python 没装 rapidocr
+    （实测踩过：用错解释器时这里才报错，前面所有文字问答都是好的，很难发现）。
+    """
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError as e:
+            raise RuntimeError(
+                "OCR 引擎不可用：缺 rapidocr_onnxruntime。"
+                "请用 .venv/Scripts/python.exe 运行本脚本，"
+                "或先 uv pip install -r requirements.txt") from e
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+
+
+def ocr_image(path: Path) -> tuple[str, float, int]:
+    """本地 OCR。返回 (全文, 平均置信度, 行数)。全程不出网。"""
+    result, _ = ocr_engine()(str(path))
+    if not result:
+        return "", 0.0, 0
+    lines = [t for _, t, _ in result]
+    confs = [float(s) for _, _, s in result]
+    return "\n".join(lines), sum(confs) / len(confs), len(result)
+
+
+def id_check(num: str) -> bool:
+    """GB 11643 校验位。号码长得像不等于号码对。"""
+    num = num.upper()
+    if len(num) != 18 or not num[:17].isdigit():
+        return False
+    return CHECK[sum(int(c) * w for c, w in zip(num[:17], WEIGHTS)) % 11] == num[17]
+
+
+def extract_fields(text: str) -> dict:
+    """从 OCR 文本里抽结构化字段。
+
+    有身份证号时按号码反推出生日期/性别（号码是权威源，图上印的字反而容易被 OCR 认错），
+    再用校验位判断这一整条记录可不可信。
+    """
+    flat = re.sub(r"\s", "", text)
+    info: dict = {"kind": "通用文本", "valid": True, "note": ""}
+    m = ID_RE.search(flat)
+    if not m:
+        return info
+    num = m.group(1).upper()
+    ok = id_check(num)
+    info.update({
+        "kind": "身份证",
+        "id_number": num,
+        "valid": ok,
+        "note": "校验位通过" if ok else "校验位不通过（号码可能被识别错，或本身是假号）",
+        "birth": f"{num[6:10]}-{num[10:12]}-{num[12:14]}",
+        "gender": "男" if int(num[16]) % 2 else "女",
+    })
+    return info
+
+
+def tiers_for_groups(groups: list[str]) -> list[str]:
+    """组 → 可写的密级库（按 .dify-tiered.json 的 groups 反向查）。"""
+    cfg = json.loads((ROOT / ".dify-tiered.json").read_text(encoding="utf-8"))
+    gs = set(groups)
+    return [t for t, v in cfg.items() if gs & set(v.get("groups", []))]
+
+
+def pending_save(token: str, open_id: str, user_name: str, tier: str,
+                 doc_name: str, text: str, confidence: float, status: str) -> None:
+    with sqlite3.connect(DB, timeout=10) as c:
+        c.execute("""INSERT OR REPLACE INTO pending
+                     (token,ts,open_id,user_name,tier,doc_name,text,confidence,doc_id,status)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                  (token, time.time(), open_id, user_name, tier, doc_name,
+                   text, confidence, "", status))
+
+
+def pending_latest(open_id: str, statuses: tuple[str, ...]) -> dict | None:
+    q = ",".join("?" * len(statuses))
+    with sqlite3.connect(DB, timeout=10) as c:
+        c.row_factory = sqlite3.Row
+        r = c.execute(f"SELECT * FROM pending WHERE open_id=? AND status IN ({q}) "
+                      f"ORDER BY ts DESC LIMIT 1", (open_id, *statuses)).fetchone()
+    return dict(r) if r else None
+
+
+def pending_update(token: str, status: str, doc_id: str = "") -> None:
+    with sqlite3.connect(DB, timeout=10) as c:
+        c.execute("UPDATE pending SET status=?, doc_id=? WHERE token=?", (status, doc_id, token))
+
+
+def mock_image(message_id: str) -> Path:
+    """mock 模式下没有真图可下载，用一张程序画的身份证顶替，好把链路跑通。"""
+    sample = OUT / "id_card_sample.png"
+    if sample.exists():
+        return sample
+    from PIL import Image, ImageDraw, ImageFont
+    W, H = 1000, 631
+    img = Image.new("RGB", (W, H), (238, 240, 245))
+    d = ImageDraw.Draw(img)
+    fp = next((f for f in [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"]
+               if Path(f).exists()), None)
+    f1 = ImageFont.truetype(fp, 42) if fp else ImageFont.load_default()
+    f2 = ImageFont.truetype(fp, 32) if fp else ImageFont.load_default()
+    d.rectangle([20, 20, W - 20, H - 20], outline=(180, 185, 200), width=3)
+    d.text((60, 50), "中华人民共和国", font=f1, fill=(30, 30, 40))
+    d.text((60, 100), "居民身份证", font=f2, fill=(30, 30, 40))
+    y = 200
+    for label, val in [("姓    名", "林嘉欣"), ("性    别", "男        民 族  汉"),
+                       ("出    生", "1990 年 3 月 7 日"),
+                       ("住    址", "广东省深圳市南山区科技园路 88 号 3 栋 1201"),
+                       ("公民身份号码", "44030419900307123X")]:
+        d.text((60, y), label, font=f2, fill=(60, 60, 70))
+        d.text((260, y), val, font=f2, fill=(20, 20, 25))
+        y += 70
+    img.save(sample, quality=95)
+    return sample
+
+
 def format_answer(name: str, data: dict) -> str:
     ans = (data.get("answer") or "").strip()
     tier = data.get("routed_tier", "")
@@ -343,11 +503,140 @@ def worker() -> None:
             TASKS.task_done()
 
 
+def reply_and_log(open_id: str, message_id: str, name: str, event_id: str,
+                  t0: float, text: str, tier: str = "", blocked: bool = False) -> None:
+    deliver(open_id, message_id, text)
+    log_reply(event_id, open_id, name, tier, blocked,
+              int((time.time() - t0) * 1000), len(text), text[:60] if blocked else "")
+
+
+def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
+    """图片 → 本地 OCR → 校验 → 按置信度决定「自动入库 / 问一次 / 让人重拍」。
+
+    分层的理由：全部要确认会让人嫌烦最后绕过去，全部自动入库会把 OCR 错误变成
+    所有人都会检索到的错答案。所以只在「不确定」时才拦人。
+    """
+    event_id, open_id, message_id = task["event_id"], task["open_id"], task["message_id"]
+    image_key = (task.get("content") or {}).get("image_key", "")
+    if not image_key:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "这张图没取到内容（缺 image_key），重发一次试试。", blocked=True)
+        return
+
+    tiers = tiers_for_groups(groups)
+    if not tiers:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"{name}，你没有可写入的知识库，无法入库。", blocked=True)
+        return
+    tier = tiers[0]
+    if ingest is None:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "写入模块没加载（dify_ingest.py），暂时不能入库。", blocked=True)
+        return
+
+    # 1. 下载
+    try:
+        if MOCK:
+            path = mock_image(message_id)
+        else:
+            path = UPLOADS / f"{message_id}.png"
+            path.write_bytes(CLIENT.download_resource(message_id, image_key, "image"))
+    except Exception as e:  # noqa: BLE001
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"下载图片失败：{e}", blocked=True)
+        return
+
+    # 2. 本地 OCR（不出网）
+    try:
+        text, conf, n = ocr_image(path)
+    except Exception as e:  # noqa: BLE001
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"OCR 没跑起来：{e}", blocked=True)
+        return
+    if not text.strip() or conf < CONF_MIN:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"这张没认清（置信度 {conf:.2f}，识别到 {n} 段文字）。\n"
+                      f"请靠近一点、对准、避开反光和手指遮挡，重拍一张。", blocked=True)
+        return
+
+    fields = extract_fields(text)
+    doc_name = f"飞书图片-{name.replace('（', '-').replace('）', '')}-" \
+               f"{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    token = hashlib.sha256(f"{message_id}{time.time()}".encode()).hexdigest()[:16]
+
+    head = [f"识别结果（{fields['kind']}，置信度 {conf:.2f}，{n} 段文字）"]
+    if fields["kind"] == "身份证":
+        head += [f"号码：{fields['id_number']}",
+                 f"校验：{fields['note']}",
+                 f"出生：{fields['birth']}　性别：{fields['gender']}"]
+    head += ["", "原文：", text[:280] + ("…" if len(text) > 280 else "")]
+
+    payload = f"[来源：飞书图片上传 by {name}]\n{text}"
+
+    # 3. 高置信度 + 校验通过 → 直接入库，给撤销窗口
+    if conf >= CONF_AUTO and fields["valid"]:
+        ok, doc_id, msg = ingest.add_text(tier, doc_name, payload)
+        if ok:
+            pending_save(token, open_id, name, tier, doc_name, text, conf, "ingested")
+            pending_update(token, "ingested", doc_id)
+            body = "\n".join(head) + f"\n\n✅ 已写入「{tier}」。5 分钟内回「撤销」可删除。"
+        else:
+            body = "\n".join(head) + f"\n\n⚠ 写入失败：{msg}"
+    else:
+        pending_save(token, open_id, name, tier, doc_name, text, conf, "awaiting")
+        why = "置信度不够高" if conf < CONF_AUTO else fields["note"]
+        body = ("\n".join(head) +
+                f"\n\n⚠ {why}。\n回「确认」写入「{tier}」，回「取消」放弃（5 分钟内有效）。")
+
+    reply_and_log(open_id, message_id, name, event_id, t0, body, tier)
+
+
+def handle_confirm(open_id: str, message_id: str, name: str, event_id: str, t0: float) -> None:
+    p = pending_latest(open_id, ("awaiting",))
+    if not p or time.time() - p["ts"] > UNDO_WINDOW:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "没有待确认的内容（5 分钟内有效）。请先发一张图片。", blocked=True)
+        return
+    ok, doc_id, msg = ingest.add_text(p["tier"], p["doc_name"], p["text"])
+    if ok:
+        pending_update(p["token"], "ingested", doc_id)
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"✅ 已写入「{p['tier']}」。5 分钟内回「撤销」可删除。", p["tier"])
+    else:
+        reply_and_log(open_id, message_id, name, event_id, t0, f"⚠ 写入失败：{msg}", blocked=True)
+
+
+def handle_cancel(open_id: str, message_id: str, name: str, event_id: str, t0: float) -> None:
+    p = pending_latest(open_id, ("awaiting",))
+    if not p:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "没有待确认的内容。", blocked=True)
+        return
+    pending_update(p["token"], "cancelled")
+    reply_and_log(open_id, message_id, name, event_id, t0, "已放弃，没有写入任何内容。")
+
+
+def handle_revoke(open_id: str, message_id: str, name: str, event_id: str, t0: float) -> None:
+    p = pending_latest(open_id, ("ingested",))
+    if not p or time.time() - p["ts"] > UNDO_WINDOW:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "没有可撤销的记录（撤销窗口 5 分钟）。", blocked=True)
+        return
+    ok, msg = ingest.delete_document(p["tier"], p["doc_id"])
+    if ok:
+        pending_update(p["token"], "revoked")
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"已从「{p['tier']}」删除该文档。", p["tier"])
+    else:
+        reply_and_log(open_id, message_id, name, event_id, t0, f"⚠ 撤销失败：{msg}", blocked=True)
+
+
 def handle_task(task: dict) -> None:
     event_id = task["event_id"]
     open_id = task["open_id"]
     message_id = task["message_id"]
-    question = task.get("text", "").strip()
+    text = task.get("text", "").strip()
+    msg_type = task.get("msg_type", "text")
     t0 = time.time()
 
     name, groups, why = resolve_identity(open_id)
@@ -357,26 +646,40 @@ def handle_task(task: dict) -> None:
                   int((time.time() - t0) * 1000), 0, why)
         return
 
-    if not question:
-        deliver(open_id, message_id, "我只处理文字问题，图片和文件还在做。")
-        log_reply(event_id, open_id, name, "", True, int((time.time() - t0) * 1000), 0, "empty")
+    if msg_type == "image":
+        handle_image(task, name, groups, t0)
         return
 
-    status, data = call_gateway(groups, question)
+    if text in CONFIRM_WORDS:
+        handle_confirm(open_id, message_id, name, event_id, t0)
+        return
+    if text in CANCEL_WORDS:
+        handle_cancel(open_id, message_id, name, event_id, t0)
+        return
+    if text in REVOKE_WORDS:
+        handle_revoke(open_id, message_id, name, event_id, t0)
+        return
+
+    if not text:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "直接问问题，或者发一张照片让我识别入库。", blocked=True)
+        return
+
+    status, data = call_gateway(groups, text)
     latency = int((time.time() - t0) * 1000)
 
     if status == 401:
-        text = "身份校验失败（令牌无效）。"
+        reply = "身份校验失败（令牌无效）。"
     elif status == 403:
-        text = f"{name}，你没有可访问的知识库。{data.get('error', '')}"
+        reply = f"{name}，你没有可访问的知识库。{data.get('error', '')}"
     elif status != 200:
-        text = f"查询失败（{status}）：{data.get('error', '未知错误')[:120]}"
+        reply = f"查询失败（{status}）：{data.get('error', '未知错误')[:120]}"
     else:
-        text = format_answer(name, data)
+        reply = format_answer(name, data)
 
-    deliver(open_id, message_id, text)
+    deliver(open_id, message_id, reply)
     log_reply(event_id, open_id, name, data.get("routed_tier", ""),
-              status != 200, latency, len(text), "" if status == 200 else str(status))
+              status != 200, latency, len(reply), "" if status == 200 else str(status))
 
 
 # ── 事件解析 ────────────────────────────────────────────────────────────────
@@ -404,7 +707,8 @@ def parse_event(body: dict) -> dict | None:
                 text = text.replace(key, "")
         return {"kind": "message", "event_id": header.get("event_id", ""),
                 "open_id": open_id, "message_id": message_id,
-                "text": text.strip(), "chat_type": msg.get("chat_type", "")}
+                "text": text.strip(), "chat_type": msg.get("chat_type", ""),
+                "msg_type": msg.get("message_type", "text"), "content": content}
 
     if etype == "contact.user.deleted_v3":
         u = event.get("object") or event.get("user") or {}
@@ -469,8 +773,11 @@ def run_ws() -> int:
                     text = text.replace(key, "")
             ok, why = enqueue({"kind": "message", "event_id": h.event_id or "",
                                "open_id": open_id, "message_id": msg.message_id or "",
-                               "text": text.strip()})
-            print(f"[ws] 消息 open_id={open_id[:12]}… {len(text)} 字 → {why}")
+                               "text": text.strip(),
+                               "msg_type": getattr(msg, "message_type", "text") or "text",
+                               "content": content})
+            print(f"[ws] 消息 open_id={open_id[:12]}… type={getattr(msg, 'message_type', '?')} "
+                  f"{len(text)} 字 → {why}")
         except Exception as ex:  # noqa: BLE001
             print(f"[warn] 长连接消息解析失败: {ex}")
 
@@ -580,11 +887,31 @@ def selftest() -> int:
     import subprocess
     import tempfile
 
-    global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN, MOCK, CLIENT
+    global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN, MOCK, CLIENT, ingest
     # 自测一律走 mock：.env 里一旦填了真实凭据，不强制就会去真调飞书 API（实测踩过）
     MOCK = True
     CLIENT = None
     VERIFY_TOKEN = "selftest-token"      # 自测里必须真的走 token 校验分支
+
+    class _FakeIngest:
+        """假的知识库写入：自测绝不能真写 Dify，否则污染真实库。"""
+
+        def __init__(self) -> None:
+            self.docs: dict[str, dict] = {}
+
+        def add_text(self, tier: str, name: str, text: str):
+            doc_id = f"fake-{len(self.docs) + 1:03d}"
+            self.docs[doc_id] = {"tier": tier, "name": name, "text": text}
+            return True, doc_id, f"已写入「{tier}」文档 {name}"
+
+        def delete_document(self, tier: str, doc_id: str):
+            if doc_id in self.docs:
+                del self.docs[doc_id]
+                return True, "已删除"
+            return False, "文档不存在"
+
+    FAKE = _FakeIngest()
+    ingest = FAKE
     tmp = Path(tempfile.mkdtemp(prefix="feishu_selftest_"))
     DB, REPLY_LOG = tmp / "bridge.db", tmp / "replies.jsonl"
     USERS_FILE, REVOKED_FILE = tmp / "users.json", tmp / "revoked.json"
@@ -612,15 +939,17 @@ def selftest() -> int:
         (passed if cond else failed).append(name)
         print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if detail else ""))
 
-    def msg_event(eid: str, open_id: str, text: str, mid: str = "om_1") -> dict:
+    def msg_event(eid: str, open_id: str, text: str, mid: str = "om_1",
+                  msg_type: str = "text", content: dict | None = None) -> dict:
+        body = json.dumps({"text": text}, ensure_ascii=False) if content is None \
+            else json.dumps(content, ensure_ascii=False)
         return {"schema": "2.0",
                 "header": {"event_id": eid, "event_type": "im.message.receive_v1",
                            "token": VERIFY_TOKEN},
                 "event": {"sender": {"sender_id": {"open_id": open_id}},
                           "message": {"message_id": mid, "chat_type": "p2p",
-                                      "message_type": "text",
-                                      "content": json.dumps({"text": text},
-                                                            ensure_ascii=False)}}}
+                                      "message_type": msg_type,
+                                      "content": body}}}
 
     print("\n== 1. URL 校验握手 ==")
     code, resp = post({"type": "url_verification", "challenge": "abc123", "token": VERIFY_TOKEN})
@@ -692,6 +1021,34 @@ def selftest() -> int:
     replies4 = read_replies()
     last = replies4[-1]["text"] if replies4 else ""
     check("离职后拒绝回答", "离职" in last, last.replace("\n", " ")[:80])
+
+    print("\n== 8. 图片上传 → 本地 OCR → 自动入库 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_img_1", "ou_mock_zhang", "", mid="om_img_1",
+                   msg_type="image", content={"image_key": "img_fake_1"}))
+    wait_replies(base_n + 1, 200)
+    r8 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("识别出身份证号", "44030419900307123X" in r8, r8.replace("\n", " ")[:110])
+    check("校验位通过", "校验位通过" in r8, r8.replace("\n", " ")[:110])
+    check("高置信度自动入库", "已写入" in r8, r8.replace("\n", " ")[:110])
+    check("假库里确实多了一条", len(FAKE.docs) == 1, f"{len(FAKE.docs)} 条")
+
+    print("\n== 9. 回「撤销」删掉刚入库的文档 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_revoke_1", "ou_mock_zhang", "撤销", mid="om_revoke_1"))
+    wait_replies(base_n + 1, 60)
+    r9 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("撤销成功", "已从" in r9 and "删除" in r9, r9.replace("\n", " ")[:110])
+    check("假库里确实空了", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+
+    print("\n== 10. 离职用户发图被拒（不留后门）==")
+    base_n = len(read_replies())
+    post(msg_event("ev_img_2", "ou_mock_li", "", mid="om_img_2",
+                   msg_type="image", content={"image_key": "img_fake_2"}))
+    wait_replies(base_n + 1, 60)
+    r10 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("离职用户不能上传", "离职" in r10, r10.replace("\n", " ")[:110])
+    check("没有写进任何库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
     srv.shutdown()
     print("\n" + "=" * 60)
