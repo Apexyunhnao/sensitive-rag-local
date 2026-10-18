@@ -510,11 +510,31 @@ def reply_and_log(open_id: str, message_id: str, name: str, event_id: str,
               int((time.time() - t0) * 1000), len(text), text[:60] if blocked else "")
 
 
-def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
-    """图片 → 本地 OCR → 校验 → 按置信度决定「自动入库 / 问一次 / 让人重拍」。
+def call_llm(question: str, context: str = "") -> tuple[bool, str]:
+    """直接调本地模型（不走知识库）。
 
-    分层的理由：全部要确认会让人嫌烦最后绕过去，全部自动入库会把 OCR 错误变成
-    所有人都会检索到的错答案。所以只在「不确定」时才拦人。
+    用途：员工发了一张图，接着问「这上面金额多少」——
+    这类问题要答的是**那张图里的字**，不是知识库，所以不能走 RAG。
+    """
+    prompt = (f"下面是一张图片的 OCR 识别文字。请只依据这些文字回答，"
+              f"看不清或文字里没有的信息就说「图片里没看到」。\n\n"
+              f"【图片文字】\n{context}\n\n【问题】{question}") if context else question
+    body = json.dumps({"model": "qwen2.5:7b", "prompt": prompt, "stream": False,
+                       "options": {"temperature": 0.1, "num_predict": 400}}).encode()
+    req = urllib.request.Request("http://127.0.0.1:11434/api/generate", data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return True, json.loads(r.read().decode()).get("response", "").strip()
+    except Exception as e:  # noqa: BLE001
+        return False, f"本地模型不可用: {e}"
+
+
+def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
+    """图片 → 本地 OCR → 回识别结果，**默认不写库**。
+
+    发照片不等于要入库：可能是想「这合同有什么问题」，也可能是私人证件不该进公司库。
+    所以这里只做识别并把选择权交回人手上：回「入库」才写，直接问问题就按图回答。
     """
     event_id, open_id, message_id = task["event_id"], task["open_id"], task["message_id"]
     image_key = (task.get("content") or {}).get("image_key", "")
@@ -526,13 +546,9 @@ def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
     tiers = tiers_for_groups(groups)
     if not tiers:
         reply_and_log(open_id, message_id, name, event_id, t0,
-                      f"{name}，你没有可写入的知识库，无法入库。", blocked=True)
+                      f"{name}，你没有可写入的知识库，只能识别不能入库。", blocked=True)
         return
     tier = tiers[0]
-    if ingest is None:
-        reply_and_log(open_id, message_id, name, event_id, t0,
-                      "写入模块没加载（dify_ingest.py），暂时不能入库。", blocked=True)
-        return
 
     # 1. 下载
     try:
@@ -571,33 +587,29 @@ def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
                  f"出生：{fields['birth']}　性别：{fields['gender']}"]
     head += ["", "原文：", text[:280] + ("…" if len(text) > 280 else "")]
 
-    payload = f"[来源：飞书图片上传 by {name}]\n{text}"
+    # 3. 存为「仅识别」状态：等用户决定是入库还是提问
+    pending_save(token, open_id, name, tier, doc_name, text, conf, "ocr_only")
 
-    # 3. 高置信度 + 校验通过 → 直接入库，给撤销窗口
-    if conf >= CONF_AUTO and fields["valid"]:
-        ok, doc_id, msg = ingest.add_text(tier, doc_name, payload)
-        if ok:
-            pending_save(token, open_id, name, tier, doc_name, text, conf, "ingested")
-            pending_update(token, "ingested", doc_id)
-            body = "\n".join(head) + f"\n\n✅ 已写入「{tier}」。5 分钟内回「撤销」可删除。"
-        else:
-            body = "\n".join(head) + f"\n\n⚠ 写入失败：{msg}"
-    else:
-        pending_save(token, open_id, name, tier, doc_name, text, conf, "awaiting")
-        why = "置信度不够高" if conf < CONF_AUTO else fields["note"]
-        body = ("\n".join(head) +
-                f"\n\n⚠ {why}。\n回「确认」写入「{tier}」，回「取消」放弃（5 分钟内有效）。")
-
+    body = ("\n".join(head) +
+            f"\n\n要怎么处理？\n"
+            f"· 回「入库」→ 写进「{tier}」\n"
+            f"· 直接问 → 我按这张图的内容回答（例如「上面的金额是多少」）\n"
+            f"（5 分钟内有效）")
     reply_and_log(open_id, message_id, name, event_id, t0, body, tier)
 
 
 def handle_confirm(open_id: str, message_id: str, name: str, event_id: str, t0: float) -> None:
-    p = pending_latest(open_id, ("awaiting",))
+    p = pending_latest(open_id, ("ocr_only", "awaiting"))
     if not p or time.time() - p["ts"] > UNDO_WINDOW:
         reply_and_log(open_id, message_id, name, event_id, t0,
-                      "没有待确认的内容（5 分钟内有效）。请先发一张图片。", blocked=True)
+                      "没有待入库的内容（5 分钟内有效）。请先发一张图片。", blocked=True)
         return
-    ok, doc_id, msg = ingest.add_text(p["tier"], p["doc_name"], p["text"])
+    if ingest is None:
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "写入模块没加载（dify_ingest.py），暂时不能入库。", blocked=True)
+        return
+    payload = f"[来源：飞书图片上传 by {name}]\n{p['text']}"
+    ok, doc_id, msg = ingest.add_text(p["tier"], p["doc_name"], payload)
     if ok:
         pending_update(p["token"], "ingested", doc_id)
         reply_and_log(open_id, message_id, name, event_id, t0,
@@ -663,6 +675,18 @@ def handle_task(task: dict) -> None:
     if not text:
         reply_and_log(open_id, message_id, name, event_id, t0,
                       "直接问问题，或者发一张照片让我识别入库。", blocked=True)
+        return
+
+    # 刚发过图、接着问了句话 → 按那张图回答（不走知识库）
+    img = pending_latest(open_id, ("ocr_only",))
+    if img and time.time() - img["ts"] <= UNDO_WINDOW:
+        ok, ans = call_llm(text, img["text"])
+        if ok:
+            reply_and_log(open_id, message_id, name, event_id, t0,
+                          f"{name}，按你刚发的那张图：\n\n{ans}\n\n"
+                          f"（要把它存进「{img['tier']}」就回「入库」）", img["tier"])
+        else:
+            reply_and_log(open_id, message_id, name, event_id, t0, ans, blocked=True)
         return
 
     status, data = call_gateway(groups, text)
@@ -1022,7 +1046,7 @@ def selftest() -> int:
     last = replies4[-1]["text"] if replies4 else ""
     check("离职后拒绝回答", "离职" in last, last.replace("\n", " ")[:80])
 
-    print("\n== 8. 图片上传 → 本地 OCR → 自动入库 ==")
+    print("\n== 8. 发图 → 识别结果，但**不自动入库** ==")
     base_n = len(read_replies())
     post(msg_event("ev_img_1", "ou_mock_zhang", "", mid="om_img_1",
                    msg_type="image", content={"image_key": "img_fake_1"}))
@@ -1030,24 +1054,44 @@ def selftest() -> int:
     r8 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
     check("识别出身份证号", "44030419900307123X" in r8, r8.replace("\n", " ")[:110])
     check("校验位通过", "校验位通过" in r8, r8.replace("\n", " ")[:110])
-    check("高置信度自动入库", "已写入" in r8, r8.replace("\n", " ")[:110])
-    check("假库里确实多了一条", len(FAKE.docs) == 1, f"{len(FAKE.docs)} 条")
+    check("问了要怎么处理", "要怎么处理" in r8, r8.replace("\n", " ")[-90:])
+    check("没有自动写库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
-    print("\n== 9. 回「撤销」删掉刚入库的文档 ==")
+    print("\n== 9. 回「入库」才真的写进去 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_ingest_1", "ou_mock_zhang", "入库", mid="om_ingest_1"))
+    wait_replies(base_n + 1, 60)
+    r9 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("写入成功", "已写入" in r9, r9.replace("\n", " ")[:110])
+    check("假库里有 1 条", len(FAKE.docs) == 1, f"{len(FAKE.docs)} 条")
+
+    print("\n== 10. 回「撤销」删掉 → 库空 ==")
     base_n = len(read_replies())
     post(msg_event("ev_revoke_1", "ou_mock_zhang", "撤销", mid="om_revoke_1"))
     wait_replies(base_n + 1, 60)
-    r9 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
-    check("撤销成功", "已从" in r9 and "删除" in r9, r9.replace("\n", " ")[:110])
-    check("假库里确实空了", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+    r10 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("撤销成功", "已从" in r10 and "删除" in r10, r10.replace("\n", " ")[:110])
+    check("假库空了", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
-    print("\n== 10. 离职用户发图被拒（不留后门）==")
+    print("\n== 11. 发图后直接提问 → 按图回答，不走知识库 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_img_3", "ou_mock_zhang", "", mid="om_img_3",
+                   msg_type="image", content={"image_key": "img_fake_3"}))
+    wait_replies(base_n + 1, 200)
+    base_n = len(read_replies())
+    post(msg_event("ev_ask_1", "ou_mock_zhang", "上面的出生日期是多少", mid="om_ask_1"))
+    wait_replies(base_n + 1, 120)
+    r11 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("走的是按图回答", "按你刚发的那张图" in r11, r11.replace("\n", " ")[:110])
+    check("没有把图写进库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+
+    print("\n== 12. 离职用户发图被拒（不留后门）==")
     base_n = len(read_replies())
     post(msg_event("ev_img_2", "ou_mock_li", "", mid="om_img_2",
                    msg_type="image", content={"image_key": "img_fake_2"}))
     wait_replies(base_n + 1, 60)
-    r10 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
-    check("离职用户不能上传", "离职" in r10, r10.replace("\n", " ")[:110])
+    r12 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("离职用户不能上传", "离职" in r12, r12.replace("\n", " ")[:110])
     check("没有写进任何库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
     srv.shutdown()
