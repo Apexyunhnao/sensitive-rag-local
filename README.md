@@ -152,10 +152,47 @@ answer = "陈大文的月薪是128,000港元。来源文档：员工花名册（
 python scripts/feishu_bridge.py --ws
 # 3. 再去飞书后台：事件与回调 → 订阅方式 → 使用长连接接收事件 → 保存
 #    添加事件：接收消息 im.message.receive_v1、员工离职 contact.user.deleted_v3
-# 4. 权限管理 → 批量加：im:message / im:message.p2p_msg / im:message.group_at_msg
-#                / im:message:send_as_bot / im:resource / contact:user.base:readonly
+# 4. 权限管理 → 批量导入（JSON 格式，见下）→ 下一步
+#    必需：im:message / im:message.p2p_msg:readonly / im:message.group_at_msg:readonly
+#          im:message:send_as_bot / im:resource
+#          contact:contact.base:readonly（调用户接口的接口级权限）
+#          contact:user.base:readonly（拿姓名）
+#          contact:user.department:readonly（拿 department_ids —— 权限映射靠它）
 # 5. 版本管理与发布 → 创建版本 → 申请发布（自建应用不发版不生效）
 # 6. 手机上给机器人发一句话，看终端是否打印 [ws] 消息 … → queued
+```
+
+权限批量导入的 JSON（贴进弹窗即可，全部是应用身份 tenant）：
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "im:message",
+      "im:message.p2p_msg:readonly",
+      "im:message.group_at_msg:readonly",
+      "im:message:send_as_bot",
+      "im:resource",
+      "contact:contact.base:readonly",
+      "contact:user.base:readonly",
+      "contact:user.department:readonly",
+      "contact:department.base:readonly",
+      "contact:user.id:readonly"
+    ]
+  }
+}
+```
+
+> ⚠️ 坑 1：`contact:user.base:readonly` **只给 name/en_name/avatar，不含 department_ids**。
+> 拿部门必须额外开 `contact:user.department:readonly`（高级权限），否则会一直报「部门未映射到任何密级」。
+> ⚠️ 坑 2：批量导入框只认上面这个 JSON 结构（`{"scopes":{"tenant":[...]}}`），
+> 不收逗号分隔的列表；`user` 数组是「以用户身份调用」的权限，这里不需要，可以整段省略。
+
+导入后验证权限链（比猜有用）：
+
+```bash
+python scripts/feishu_probe.py                 # token + 部门列表 + 生成 depmap 模板
+python scripts/feishu_probe.py --phone 138xxx  # 顺带验证「手机号 → department_ids」通不通
 ```
 
 部门 → 密级 的映射：飞书返回的是部门 id，需要建 `out/feishu_depmap.json`：
