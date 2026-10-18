@@ -16,12 +16,15 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -89,6 +92,251 @@ def status() -> dict:
         "gateway": _probe(f"{GATEWAY}/audit"),
         "identities": {k: {"name": v["name"], "dept": v["dept"]} for k, v in IDENTITIES.items()},
     }
+
+
+# ── 项目总览：扫本地项目目录，给出「每个项目现在什么状态」 ──────────────
+PROJECTS_ROOT = Path(os.getenv("PROJECTS_ROOT", r"E:\Projects"))
+
+
+def _git_run(cwd: Path, *args: str, timeout: int = 6) -> tuple[bool, str]:
+    """跑一条 git 命令，返回 (是否成功, stdout)。
+
+    不再把非 0 返回码静默吞成空字符串 —— 否则「仓库损坏」会和「字段本来就空」
+    长得一模一样，页面上看不出任何异常。
+    """
+    try:
+        out = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8", errors="replace",
+        )
+        return out.returncode == 0, out.stdout.strip()
+    except Exception:
+        return False, ""
+
+
+def _git(cwd: Path, *args: str, timeout: int = 6) -> str:
+    return _git_run(cwd, *args, timeout=timeout)[1]
+
+
+# —— 项目总览：哪些目录算项目 ——
+# 第一层：硬编码排除明显噪音（临时/试验/备份/数据目录）
+_EXCLUDE_KEYWORDS = ("backup", "tmp")
+_EXCLUDE_SUFFIX = ("-data", "_data")
+
+# 第二层：非 git 目录靠信号判断是不是真项目
+_PROJECT_MARKERS = (
+    "package.json", "pyproject.toml", "requirements.txt", "Cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "README.md", "README.en.md",
+)
+_SOURCE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".java", ".go", ".rs", ".kt"}
+_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+    ".next", "target", ".idea", ".vscode", "file_stores",
+}
+
+
+def _is_noise_dir(name: str) -> tuple[bool, str]:
+    low = name.lower()
+    if name.startswith("_"):
+        return True, "下划线开头（临时/试验目录）"
+    if any(k in low for k in _EXCLUDE_KEYWORDS):
+        return True, "名字含备份/临时关键词"
+    if low.endswith(_EXCLUDE_SUFFIX):
+        return True, "数据/备份目录"
+    return False, ""
+
+
+def _count_sources(d: Path, limit: int = 50, max_depth: int = 3) -> int:
+    """数二级～三级以内的源码文件（剪掉 node_modules 等，带上限，不做全盘遍历）。"""
+    n = 0
+    base = len(str(d))
+    try:
+        for root, dirs, files in os.walk(d):
+            rel = str(root)[base:]
+            if rel.count(os.sep) >= max_depth:
+                dirs[:] = []
+                continue
+            dirs[:] = [x for x in dirs if x not in _SKIP_DIRS and not x.startswith(".")]
+            for f in files:
+                if Path(f).suffix.lower() in _SOURCE_EXTS:
+                    n += 1
+                    if n >= limit:
+                        return n
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+def _project_signals(d: Path) -> tuple[bool, str]:
+    for m in _PROJECT_MARKERS:
+        if (d / m).exists():
+            return True, m
+    cnt = _count_sources(d)
+    if cnt >= 5:
+        return True, f"{cnt}+ 个源码文件"
+    return False, ""
+
+
+
+def _scan_one(d: Path) -> dict:
+    """一个目录 → 一条项目记录。全部来自文件系统和 git，不调模型。"""
+    noise, noise_reason = _is_noise_dir(d.name)
+    info: dict = {
+        "name": d.name,
+        "path": str(d),
+        "is_git": False,
+        "broken": False,          # .git 在但 HEAD 无效（损坏/空仓库）
+        "branch": "",
+        "upstream": "",
+        "last_commit": "",
+        "last_commit_time": "",
+        "dirty": 0,
+        "ahead": None,            # None = 没有上游分支 / 不知道推没推，不要当成 0
+        "mtime": 0,
+        "readme": "",
+        "size_mb": 0,
+        "lang": "",
+        "is_project": True,
+        "project_signal": "",
+        "excluded": noise,
+        "exclude_reason": noise_reason,
+    }
+    try:
+        info["mtime"] = int(d.stat().st_mtime)
+    except Exception:
+        pass
+
+    # 判是不是 git 仓库：跑命令看 exit code（`.git` 存在性判断不了 worktree / 损坏仓库）
+    info["is_git"] = _git_run(d, "rev-parse", "--is-inside-work-tree")[0]
+
+    if info["is_git"]:
+        head_ok, _ = _git_run(d, "rev-parse", "--verify", "HEAD")
+        if not head_ok:
+            # .git 在、但 HEAD 指向不存在的提交（空仓库或损坏）—— 明确标出来
+            info["broken"] = True
+        else:
+            info["branch"] = _git(d, "rev-parse", "--abbrev-ref", "HEAD")
+            info["last_commit"] = _git(d, "log", "-1", "--pretty=%s")
+            info["last_commit_time"] = _git(d, "log", "-1", "--pretty=%cI")
+            st = _git(d, "status", "--porcelain")
+            info["dirty"] = len([x for x in st.splitlines() if x.strip()])
+            up_ok, up = _git_run(d, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+            if up_ok and up:
+                info["upstream"] = up
+                cnt_ok, cnt = _git_run(d, "rev-list", "--count", "@{u}..HEAD")
+                info["ahead"] = int(cnt) if cnt_ok and cnt.isdigit() else None
+
+    if info["is_git"]:
+        info["is_project"] = True
+        info["project_signal"] = "git 仓库"
+    else:
+        sig, why = _project_signals(d)
+        info["is_project"] = sig
+        info["project_signal"] = why
+
+    for cand in ("README.md", "README.en.md", "readme.md"):
+        p = d / cand
+        if p.exists():
+            try:
+                lines = [
+                    ln.strip() for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip() and not ln.startswith("#") and not ln.startswith(">") and not ln.startswith("!")
+                ]
+                info["readme"] = " ".join(lines[:2])[:160]
+                info["readme_file"] = cand
+            except Exception:
+                pass
+            break
+
+    # 语言线索（只看顶层，避免遍历大目录）
+    try:
+        exts: dict[str, int] = {}
+        for child in list(d.iterdir())[:200]:
+            if child.is_file():
+                exts[child.suffix.lower()] = exts.get(child.suffix.lower(), 0) + 1
+        for sub in ("src", "app", "backend", "frontend"):
+            sp = d / sub
+            if sp.is_dir():
+                for f in list(sp.rglob("*"))[:120]:
+                    if f.is_file():
+                        exts[f.suffix.lower()] = exts.get(f.suffix.lower(), 0) + 1
+        mapping = {
+            ".py": "Python", ".ts": "TypeScript", ".js": "JavaScript", ".vue": "Vue",
+            ".java": "Java", ".go": "Go", ".rs": "Rust", ".kt": "Kotlin",
+        }
+        best = max(
+            ((mapping[k], v) for k, v in exts.items() if k in mapping),
+            key=lambda x: x[1], default=("", 0),
+        )
+        info["lang"] = best[0]
+    except Exception:
+        pass
+
+    return info
+
+
+def _week_ago() -> str:
+    import datetime as _dt
+    return (_dt.datetime.now() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+@app.get("/api/projects")
+def projects() -> dict:
+    """列出项目目录下的所有项目及其真实状态（git 分支/最后提交/未提交数）。
+
+    过滤分两层（2026-10-19 加，之前是「E:\\Projects 下每个目录都算项目」）：
+    1. 硬编码排除：下划线开头（临时/试验）、名字含 backup / tmp、以 -data / _data 结尾
+    2. 非 git 目录看信号：有 package.json / requirements.txt / README 等标记，或有 ≥5 个源码文件
+
+    被排掉的目录不丢，放在 `excluded` 里（带原因），页面可展开查看 ——
+    避免出现「我的目录怎么不见了」这种黑箱感。
+    """
+    t0 = time.time()
+    if not PROJECTS_ROOT.is_dir():
+        return {"ok": False, "error": f"目录不存在：{PROJECTS_ROOT}", "projects": []}
+
+    try:
+        dirs = [d for d in PROJECTS_ROOT.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "projects": []}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        items = list(ex.map(_scan_one, dirs))
+
+    kept = [i for i in items if not i["excluded"] and i["is_project"]]
+    dropped = [
+        {
+            "name": i["name"],
+            "reason": i["exclude_reason"]
+            or "没有项目特征（无 package.json / README，源码文件 < 5）",
+        }
+        for i in items
+        if i["excluded"] or not i["is_project"]
+    ]
+    kept.sort(key=lambda x: x.get("last_commit_time") or "", reverse=True)
+
+    week = _week_ago()
+
+    def _count(fn) -> int:
+        return sum(1 for i in kept if fn(i))
+
+    return {
+        "ok": True,
+        "root": str(PROJECTS_ROOT),
+        "count": len(kept),
+        "git_count": _count(lambda i: i["is_git"]),
+        "untracked_count": _count(lambda i: not i["is_git"]),
+        "dirty_count": _count(lambda i: (i["dirty"] or 0) > 0),
+        "unpushed_count": _count(lambda i: (i["ahead"] or 0) > 0),
+        "broken_count": _count(lambda i: i["broken"]),
+        "recent_count": _count(lambda i: i.get("last_commit_time", "")[:10] >= week),
+        "scanned_total": len(items),
+        "excluded_count": len(dropped),
+        "elapsed_ms": round((time.time() - t0) * 1000),
+        "projects": kept,
+        "excluded": dropped,
+    }
+
 
 
 def _diff_files(pa: Path, pb: Path, name_a: str, name_b: str) -> JSONResponse:
