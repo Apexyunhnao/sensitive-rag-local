@@ -1,0 +1,20 @@
+# 核心依赖（Python 3.12）
+# 装法：uv pip install --python .venv/Scripts/python.exe -r requirements.txt
+# 国内源：--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# PDF / 图片解析
+pymupdf==1.28.2
+pdfplumber==0.11.10
+pillow==12.3.0
+
+# 本地 OCR（身份证/扫描件，纯本地推理，不出网）
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.31.0
+opencv-python==5.0.0.93
+numpy==2.5.4
+
+# Dify 控制台 / 数据集 API
+requests==2.34.2
+
+# 飞书长连接（仅 --ws 模式需要；HTTP 回调模式不需要）
+lark-oapi==1.7.5

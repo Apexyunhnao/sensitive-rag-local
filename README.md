@@ -128,9 +128,41 @@ answer = "陈大文的月薪是128,000港元。来源文档：员工花名册（
 ```
 
 > **现状边界**：目前只有 mock 模式跑通（读 `out/feishu_users.json` 的 open_id→部门映射，
-> 回复写 `out/feishu_replies.jsonl`）。接真飞书要补 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` /
-> `FEISHU_VERIFY_TOKEN`，并在飞书后台配事件订阅地址与 `im:message`、`contact:user.base:readonly` 权限。
+> 回复写 `out/feishu_replies.jsonl`）。接真飞书要补 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`，
+> 并在飞书后台配事件订阅与 `im:message`、`contact:user.base:readonly` 权限。
 > **图片与文件消息还没做**（下一阶段）。
+
+### 接真环境：用长连接，不用公网 IP
+
+飞书事件有两条路，内网部署只能走第二条：
+
+| 订阅方式 | 要求 | 适用 |
+|---|---|---|
+| HTTP 回调（`--port 8091`） | 飞书服务器要能访问你的 URL ⇒ **必须公网 IP / 域名 / 内网穿透** | 有公网服务器时 |
+| **长连接 `--ws`（推荐）** | 本地主动连飞书（出站即可），**不需要公网 IP、不需要内网穿透** | 内网/本机 |
+
+长连接的代价与限制：只支持企业自建应用；事件仍要在 **3 秒内处理完**（超时重推，所以照样异步）；
+同一应用多实例时只有一个实例会收到事件（集群模式，不广播）。
+
+配置顺序（顺序错了保存不成功）：
+
+```bash
+# 1. 凭据放 .env（cp .env.example .env 后填 app_secret）
+# 2. 先启动客户端 —— 必须在长连接在线时，飞书后台才允许保存「使用长连接接收事件」
+python scripts/feishu_bridge.py --ws
+# 3. 再去飞书后台：事件与回调 → 订阅方式 → 使用长连接接收事件 → 保存
+#    添加事件：接收消息 im.message.receive_v1、员工离职 contact.user.deleted_v3
+# 4. 权限管理 → 批量加：im:message / im:message.p2p_msg / im:message.group_at_msg
+#                / im:message:send_as_bot / im:resource / contact:user.base:readonly
+# 5. 版本管理与发布 → 创建版本 → 申请发布（自建应用不发版不生效）
+# 6. 手机上给机器人发一句话，看终端是否打印 [ws] 消息 … → queued
+```
+
+部门 → 密级 的映射：飞书返回的是部门 id，需要建 `out/feishu_depmap.json`：
+
+```json
+{ "od-xxxxxxxxxxxxxxxx": ["compliance"], "od-yyyyyyyyyyyyyyyy": ["hr"] }
+```
 
 ---
 
@@ -196,3 +228,4 @@ python scripts/feishu_bridge.py --port 8091    # 起服务
 ## 技术栈
 
 Dify 1.17.1 · Ollama (qwen2.5:7b, bge-m3) · RapidOCR · pymupdf · Playwright · Python 3.12
+lark-oapi 1.7.5（仅长连接模式，HTTP 回调模式零依赖）

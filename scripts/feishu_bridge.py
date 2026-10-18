@@ -51,6 +51,25 @@ REPLY_LOG = OUT / "feishu_replies.jsonl"
 GATEWAY = "http://127.0.0.1:8090/ask"
 FEISHU_BASE = "https://open.feishu.cn"
 
+
+def _load_dotenv() -> None:
+    """读项目根目录 .env（已在 .gitignore 里）。
+
+    凭据只放这里或系统环境变量，不要写进代码或提交进仓库。
+    """
+    f = ROOT / ".env"
+    if not f.exists():
+        return
+    for line in f.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
 APP_ID = os.environ.get("FEISHU_APP_ID", "").strip()
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "").strip()
 VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN", "").strip()
@@ -362,6 +381,90 @@ def parse_event(body: dict) -> dict | None:
     return None
 
 
+def enqueue(task: dict) -> tuple[bool, str]:
+    """HTTP 回调和长连接两个入口共用：幂等抢占 → 入队。返回 (是否新事件, 说明)。"""
+    eid = task.get("event_id") or hashlib.sha256(
+        (task.get("open_id", "") + task.get("text", "") + str(time.time_ns())).encode()
+    ).hexdigest()[:16]
+    if not claim_event(eid, task.get("open_id", ""), task.get("kind", "message")):
+        return False, "duplicate"
+    task["event_id"] = eid
+    if task.get("kind") == "user_deleted":
+        if task.get("open_id"):
+            revoke(task["open_id"])
+        return True, "revoked"
+    TASKS.put(task)
+    return True, "queued"
+
+
+# ── 长连接模式（真环境推荐：无需公网 IP / 内网穿透）─────────────────────────
+
+def run_ws() -> int:
+    """飞书 WebSocket 长连接：本地主动连飞书，事件从这条通道推过来。
+
+    比 HTTP 回调更适合内网部署：
+      · 无需公网 IP、无需域名、无需内网穿透（只要本机能出公网）
+      · SDK 建连时鉴权，后续事件已是明文，不用自己验签解密
+      · 限制：仅企业自建应用；仍需 3 秒内返回（超时会重推）；多实例只有一个收到
+    """
+    if MOCK:
+        print("长连接模式需要真实凭据：请设置 FEISHU_APP_ID / FEISHU_APP_SECRET")
+        return 1
+    try:
+        import lark_oapi as lark
+    except ImportError:
+        print("缺依赖：uv pip install --python .venv/Scripts/python.exe lark-oapi")
+        return 1
+
+    db_init()
+    threading.Thread(target=worker, daemon=True).start()
+
+    def on_msg(data) -> None:
+        try:
+            e, h = data.event, data.header
+            msg = e.message
+            sid = getattr(e.sender, "sender_id", None)
+            open_id = (getattr(sid, "open_id", "") or "") if sid else ""
+            try:
+                content = json.loads(msg.content or "{}")
+            except json.JSONDecodeError:
+                content = {}
+            text = content.get("text", "")
+            for m in (msg.mentions or []):
+                key = getattr(m, "key", "") or ""
+                if key:
+                    text = text.replace(key, "")
+            ok, why = enqueue({"kind": "message", "event_id": h.event_id or "",
+                               "open_id": open_id, "message_id": msg.message_id or "",
+                               "text": text.strip()})
+            print(f"[ws] 消息 open_id={open_id[:12]}… {len(text)} 字 → {why}")
+        except Exception as ex:  # noqa: BLE001
+            print(f"[warn] 长连接消息解析失败: {ex}")
+
+    def on_user_deleted(data) -> None:
+        try:
+            oid = getattr(data.event.object, "open_id", "") or ""
+            ok, why = enqueue({"kind": "user_deleted", "event_id": data.header.event_id or "",
+                               "open_id": oid, "message_id": "", "text": ""})
+            print(f"[ws] 离职事件 open_id={oid[:12]}… → {why}")
+        except Exception as ex:  # noqa: BLE001
+            print(f"[warn] 离职事件解析失败: {ex}")
+
+    handler = (lark.EventDispatcherHandler.builder("", "")
+               .register_p2_im_message_receive_v1(on_msg)
+               .register_p2_contact_user_deleted_v3(on_user_deleted)
+               .build())
+
+    print("飞书长连接启动中…（Ctrl+C 退出）")
+    print("提示：飞书后台「事件与回调 → 订阅方式」此时才能选『使用长连接接收事件』并保存成功")
+    try:
+        lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler,
+                       log_level=lark.LogLevel.INFO).start()
+    except KeyboardInterrupt:
+        print("\n已退出")
+    return 0
+
+
 # ── HTTP 层 ─────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -422,23 +525,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"code": 0, "note": "ignored"})
             return
 
-        # 3. 幂等：同 event_id 只处理一次（飞书重试会重发）
-        eid = task["event_id"] or hashlib.sha256(raw).hexdigest()[:16]
-        if not claim_event(eid, task["open_id"], task["kind"]):
-            self._send(200, {"code": 0, "note": "duplicate"})
-            return
-
-        # 4. 离职事件同步处理（不碰模型，很快）
-        if task["kind"] == "user_deleted":
-            if task["open_id"]:
-                revoke(task["open_id"])
-            self._send(200, {"code": 0, "note": "revoked"})
-            return
-
-        # 5. 消息事件：立刻 200，异步处理
-        task["event_id"] = eid
-        TASKS.put(task)
-        self._send(200, {"code": 0})
+        # 3. 幂等 + 入队（与长连接模式共用同一条路径）
+        _, why = enqueue(task)
+        self._send(200, {"code": 0, "note": why})
 
 
 def serve(port: int) -> None:
@@ -581,9 +670,13 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--load", action="store_true")
+    ap.add_argument("--ws", action="store_true",
+                    help="用飞书长连接收事件（真环境推荐，无需公网 IP）")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
+    if a.ws:
+        sys.exit(run_ws())
     if a.load:
         print("模式:", "mock" if MOCK else "real")
         print("员工名册:", json.dumps(LOCAL_USERS, ensure_ascii=False, indent=2))
