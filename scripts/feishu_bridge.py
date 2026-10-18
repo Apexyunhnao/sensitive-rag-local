@@ -516,8 +516,9 @@ def call_llm(question: str, context: str = "") -> tuple[bool, str]:
     用途：员工发了一张图，接着问「这上面金额多少」——
     这类问题要答的是**那张图里的字**，不是知识库，所以不能走 RAG。
     """
-    prompt = (f"下面是一张图片的 OCR 识别文字。请只依据这些文字回答，"
-              f"看不清或文字里没有的信息就说「图片里没看到」。\n\n"
+    prompt = (f"下面是一张图片的文字识别结果（可能有识别错误）。请只依据这些文字回答；"
+              f"文字里没有的信息就说「图片里没看到」，不要猜、不要补充常识。"
+              f"如果对方是在问图片里有什么、让复述内容，就把这些文字整理成简洁条目给他。\n\n"
               f"【图片文字】\n{context}\n\n【问题】{question}") if context else question
     body = json.dumps({"model": "qwen2.5:7b", "prompt": prompt, "stream": False,
                        "options": {"temperature": 0.1, "num_predict": 400}}).encode()
@@ -599,10 +600,20 @@ def handle_image(task: dict, name: str, groups: list[str], t0: float) -> None:
 
 
 def handle_confirm(open_id: str, message_id: str, name: str, event_id: str, t0: float) -> None:
-    p = pending_latest(open_id, ("ocr_only", "awaiting"))
+    p = pending_latest(open_id, ("ocr_only", "awaiting", "ingested", "revoked"))
     if not p or time.time() - p["ts"] > UNDO_WINDOW:
         reply_and_log(open_id, message_id, name, event_id, t0,
                       "没有待入库的内容（5 分钟内有效）。请先发一张图片。", blocked=True)
+        return
+    if p["status"] == "ingested":
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      f"这张图已经在「{p['tier']}」里了（{p['doc_name']}）。\n"
+                      f"重复写入只会让库里多一条重复内容，所以没有再加。\n"
+                      f"要存新的一张请重新发图。", blocked=True)
+        return
+    if p["status"] == "revoked":
+        reply_and_log(open_id, message_id, name, event_id, t0,
+                      "这张图刚才被撤销了。要重新入库请再发一次图片。", blocked=True)
         return
     if ingest is None:
         reply_and_log(open_id, message_id, name, event_id, t0,
@@ -678,7 +689,9 @@ def handle_task(task: dict) -> None:
         return
 
     # 刚发过图、接着问了句话 → 按那张图回答（不走知识库）
-    img = pending_latest(open_id, ("ocr_only",))
+    # 注意：这里的图片上下文与「是否入库」无关 —— 入库、撤销之后那张图仍然可问，
+    # 所以不能只查 ocr_only（实测踩过：撤销后问「刚刚识别的图片」变成去查知识库）
+    img = pending_latest(open_id, ("ocr_only", "awaiting", "ingested", "revoked"))
     if img and time.time() - img["ts"] <= UNDO_WINDOW:
         ok, ans = call_llm(text, img["text"])
         if ok:
@@ -911,10 +924,12 @@ def selftest() -> int:
     import subprocess
     import tempfile
 
-    global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN, MOCK, CLIENT, ingest
+    global DB, REPLY_LOG, USERS_FILE, REVOKED_FILE, VERIFY_TOKEN, MOCK, CLIENT, ingest, call_llm
     # 自测一律走 mock：.env 里一旦填了真实凭据，不强制就会去真调飞书 API（实测踩过）
     MOCK = True
     CLIENT = None
+    # 自测不真调模型：7B 单卡一次 5-15 秒，两项就是半分钟起，会把自测拖到超时（实测 420s 被打断）
+    call_llm = lambda q, ctx="": (True, f"[假模型] 依据图片文字回答：{q}")
     VERIFY_TOKEN = "selftest-token"      # 自测里必须真的走 token 校验分支
 
     class _FakeIngest:
@@ -1093,6 +1108,28 @@ def selftest() -> int:
     r12 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
     check("离职用户不能上传", "离职" in r12, r12.replace("\n", " ")[:110])
     check("没有写进任何库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
+
+    print("\n== 13. 重复回「入库」被挡，不产生重复文档 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_ingest_2", "ou_mock_zhang", "入库", mid="om_ingest_2"))
+    wait_replies(base_n + 1, 60)
+    base_n = len(read_replies())
+    post(msg_event("ev_ingest_3", "ou_mock_zhang", "入库", mid="om_ingest_3"))
+    wait_replies(base_n + 1, 60)
+    r13 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("第二次被挡", "已经在" in r13, r13.replace("\n", " ")[:110])
+    check("库里还是 1 条", len(FAKE.docs) == 1, f"{len(FAKE.docs)} 条")
+
+    print("\n== 14. 撤销之后仍能对那张图提问 ==")
+    base_n = len(read_replies())
+    post(msg_event("ev_revoke_2", "ou_mock_zhang", "撤销", mid="om_revoke_2"))
+    wait_replies(base_n + 1, 60)
+    base_n = len(read_replies())
+    post(msg_event("ev_ask_2", "ou_mock_zhang", "刚刚识别的图片", mid="om_ask_2"))
+    wait_replies(base_n + 1, 120)
+    r14 = read_replies()[-1]["text"] if len(read_replies()) > base_n else ""
+    check("撤销后仍按图回答", "按你刚发的那张图" in r14, r14.replace("\n", " ")[:120])
+    check("撤销后没偷偷写回库", len(FAKE.docs) == 0, f"{len(FAKE.docs)} 条")
 
     srv.shutdown()
     print("\n" + "=" * 60)
