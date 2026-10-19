@@ -29,6 +29,8 @@ AUDIT_DB = ROOT / "out" / "gateway_audit.db"
 # 这里用预共享令牌模拟：请求必须带 Authorization: Bearer <token>，
 # 否则任何人都能伪造 user 字段绕过权限。
 USERS = {
+    "huang": {"groups": ["compliance"], "name": "黄文浩（法务合规部）",
+              "token": "token-huang-compliance"},
     "zhang": {"groups": ["compliance"], "name": "张三（合规部）",
               "token": "tk-zhang-7f3a9c2e"},
     "wang": {"groups": ["board"], "name": "王五（董事）",

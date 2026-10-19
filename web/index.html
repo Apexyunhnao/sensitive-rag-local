@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23E07A3F'/%3E%3Cpath d='M9 22V10h4.6c3 0 4.9 1.5 4.9 3.9 0 1.7-1 2.9-2.6 3.4l3.2 4.7h-2.9l-2.8-4.3H11.4V22H9zm2.4-6.2h2.1c1.5 0 2.4-.7 2.4-1.9 0-1.2-.9-1.8-2.4-1.8h-2.1v3.7z' fill='%23fff'/%3E%3C/svg%3E">
+<title>内网敏感数据助手 · 本地模型 + 权限隔离 + 审计</title>
+<style>
+:root{
+  --bg:#FAF7F2; --panel:#FFFFFF; --ink:#2A2622; --muted:#7A736B; --faint:#A69C90;
+  --line:#E8E0D6; --line-soft:#F1EAE1;
+  --accent:#E07A3F; --accent-soft:#FDF0E7; --accent-ink:#B85C29;
+  --green:#3E8E6E; --green-soft:#EAF5F0;
+  --red:#C2453D; --red-soft:#FBEDEC;
+  --amber:#C98A1E; --amber-soft:#FBF3E0;
+  --shadow:0 1px 2px rgba(42,38,34,.04), 0 8px 24px rgba(42,38,34,.05);
+  --r:12px; --r-lg:16px;
+}
+*{box-sizing:border-box; margin:0; padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  background:var(--bg); color:var(--ink);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1120px; margin:0 auto; padding:28px 24px 64px}
+
+/* ---------- 顶栏 ---------- */
+header{display:flex; align-items:flex-start; justify-content:space-between; gap:24px; flex-wrap:wrap; margin-bottom:26px}
+.brand h1{font-size:21px; font-weight:650; letter-spacing:-.3px}
+.brand p{color:var(--muted); font-size:13.5px; margin-top:5px}
+.status{display:flex; gap:16px; align-items:center; font-size:12.5px; color:var(--muted); font-family:ui-monospace,Consolas,monospace}
+.dot{display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; background:var(--faint); vertical-align:1px}
+.dot.ok{background:var(--green)} .dot.bad{background:var(--red)}
+.who{display:flex; align-items:center; gap:8px; background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:5px 6px 5px 14px; box-shadow:var(--shadow)}
+.who label{font-size:12.5px; color:var(--muted)}
+.who select{border:0; background:transparent; font:inherit; font-size:13.5px; color:var(--ink); padding:4px 8px; cursor:pointer; outline:none}
+.who .dept{font-size:12px; color:var(--accent-ink); background:var(--accent-soft); border-radius:999px; padding:2px 9px; margin-right:4px}
+
+/* ---------- Tabs ---------- */
+nav{display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:26px}
+nav button{
+  appearance:none; border:0; background:transparent; font:inherit; font-size:14.5px;
+  color:var(--muted); padding:11px 16px 13px; cursor:pointer; border-bottom:2px solid transparent;
+  transition:color .15s ease, border-color .15s ease; margin-bottom:-1px;
+}
+nav button:hover{color:var(--ink)}
+nav button.on{color:var(--accent-ink); border-bottom-color:var(--accent); font-weight:600}
+nav button .n{font-family:ui-monospace,Consolas,monospace; font-size:11.5px; color:var(--faint); margin-right:6px}
+
+/* ---------- 通用卡片 ---------- */
+.card{background:var(--panel); border:1px solid var(--line); border-radius:var(--r-lg); box-shadow:var(--shadow)}
+.pad{padding:22px 24px}
+.sec-title{font-size:13px; font-weight:600; letter-spacing:.02em; color:var(--muted); text-transform:uppercase; margin-bottom:14px}
+.hint{font-size:12.5px; color:var(--faint); line-height:1.6}
+
+/* ---------- 问答 ---------- */
+.ask-grid{display:grid; grid-template-columns:1fr 340px; gap:20px; align-items:start}
+@media(max-width:900px){.ask-grid{grid-template-columns:1fr}}
+
+textarea{
+  width:100%; min-height:96px; resize:vertical; border:1px solid var(--line); border-radius:var(--r);
+  padding:14px 16px; font:inherit; font-size:15px; color:var(--ink); background:var(--bg);
+  outline:none; transition:border-color .15s, box-shadow .15s;
+}
+textarea:focus{border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); background:#fff}
+.chips{display:flex; flex-wrap:wrap; gap:8px; margin-top:12px}
+.chip{
+  border:1px solid var(--line); background:var(--panel); border-radius:999px;
+  padding:6px 13px; font-size:12.5px; color:var(--muted); cursor:pointer; font-family:inherit;
+  transition:all .15s ease;
+}
+.chip:hover{border-color:var(--accent); color:var(--accent-ink); background:var(--accent-soft)}
+.actions{display:flex; align-items:center; gap:12px; margin-top:16px}
+.btn{
+  appearance:none; border:0; border-radius:10px; background:var(--accent); color:#fff;
+  font:inherit; font-size:14.5px; font-weight:600; padding:10px 22px; cursor:pointer;
+  transition:background .15s, transform .05s;
+}
+.btn:hover{background:var(--accent-ink)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{background:var(--faint); cursor:not-allowed}
+.btn.ghost{background:transparent; color:var(--muted); border:1px solid var(--line); font-weight:500; padding:8px 16px; font-size:13px}
+.btn.ghost:hover{color:var(--ink); border-color:var(--faint); background:var(--panel)}
+
+/* 答案 */
+.answer{margin-top:22px}
+.answer-head{display:flex; align-items:center; gap:10px; margin-bottom:12px; font-size:12.5px; color:var(--muted)}
+.answer-body{font-size:15.5px; line-height:1.85; white-space:pre-wrap}
+.answer-meta{display:flex; gap:18px; margin-top:16px; padding-top:14px; border-top:1px dashed var(--line); font-size:12px; color:var(--faint); font-family:ui-monospace,Consolas,monospace}
+
+/* 来源 */
+.src{display:flex; flex-direction:column; gap:10px}
+.src-item{padding:12px 14px; border:1px solid var(--line-soft); border-radius:var(--r); background:var(--bg)}
+.src-top{display:flex; justify-content:space-between; gap:10px; font-size:13px}
+.src-name{font-family:ui-monospace,Consolas,monospace; font-size:12.5px; color:var(--ink); word-break:break-all}
+.src-score{font-family:ui-monospace,Consolas,monospace; font-size:12px; color:var(--muted); white-space:nowrap}
+.bar{height:4px; border-radius:2px; background:var(--line-soft); margin-top:9px; overflow:hidden}
+.bar i{display:block; height:100%; border-radius:2px; background:var(--green)}
+.bar i.mid{background:var(--amber)} .bar i.low{background:var(--red)}
+
+/* 状态条 */
+.alert{display:none; margin-top:16px; padding:13px 16px; border-radius:var(--r); font-size:14px; line-height:1.6}
+.alert.show{display:block}
+.alert.err{background:var(--red-soft); color:#8E322B; border:1px solid #F0D3D0}
+.alert.info{background:var(--accent-soft); color:var(--accent-ink); border:1px solid #F3DCCB}
+.alert.warn{background:var(--amber-soft); color:#8A5E12; border:1px solid #EFE0BD}
+
+/* 加载 */
+.loading{display:none; align-items:center; gap:10px; margin-top:16px; font-size:13.5px; color:var(--muted)}
+.loading.show{display:flex}
+.spinner{width:16px; height:16px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* 空状态 */
+.empty{padding:44px 20px; text-align:center; color:var(--faint); font-size:13.5px}
+.empty b{display:block; color:var(--muted); font-weight:600; font-size:15px; margin-bottom:6px}
+
+/* ---------- 合同比对 ---------- */
+.drop-grid{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+@media(max-width:760px){.drop-grid{grid-template-columns:1fr}}
+.drop{
+  border:1.5px dashed var(--line); border-radius:var(--r-lg); background:var(--panel);
+  padding:28px 20px; text-align:center; cursor:pointer; transition:all .15s ease;
+}
+.drop:hover,.drop.over{border-color:var(--accent); background:var(--accent-soft)}
+.drop .ico{font-size:24px; margin-bottom:8px; opacity:.7}
+.drop .t{font-size:14px; font-weight:600; color:var(--ink)}
+.drop .f{font-size:12.5px; color:var(--faint); margin-top:5px; font-family:ui-monospace,Consolas,monospace; word-break:break-all}
+.drop.has{border-style:solid; border-color:var(--green); background:var(--green-soft)}
+.drop.has .t{color:var(--green)}
+input[type=file]{display:none}
+
+.summary{display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:22px 0 18px}
+@media(max-width:760px){.summary{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--panel); border:1px solid var(--line); border-radius:var(--r); padding:14px 16px}
+.stat .k{font-size:12px; color:var(--muted)}
+.stat .v{font-size:23px; font-weight:650; font-family:ui-monospace,Consolas,monospace; margin-top:3px; letter-spacing:-.5px}
+.stat .v.red{color:var(--red)} .stat .v.green{color:var(--green)} .stat .v.amber{color:var(--amber)}
+
+.change{border:1px solid var(--line); border-radius:var(--r); background:var(--panel); margin-bottom:10px; overflow:hidden}
+.change.crit{border-left:3px solid var(--red)}
+.ch-head{display:flex; align-items:center; gap:10px; padding:13px 16px; cursor:pointer; user-select:none}
+.ch-head:hover{background:var(--bg)}
+.ch-id{font-family:ui-monospace,Consolas,monospace; font-size:12.5px; color:var(--muted); min-width:52px}
+.ch-title{flex:1; font-size:14px; font-weight:550; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.badge{font-size:11.5px; padding:2px 9px; border-radius:999px; font-weight:600; white-space:nowrap}
+.badge.mod{background:var(--accent-soft); color:var(--accent-ink)}
+.badge.add{background:var(--green-soft); color:var(--green)}
+.badge.del{background:var(--red-soft); color:var(--red)}
+.badge.num{background:var(--line-soft); color:var(--muted)}
+.badge.crit{background:var(--red-soft); color:var(--red)}
+.ch-body{display:none; padding:4px 16px 16px 78px; font-size:13.5px; line-height:1.75}
+.ch-body.open{display:block}
+.diff-line{margin-top:7px; padding:8px 11px; border-radius:8px; font-family:ui-monospace,Consolas,monospace; font-size:12.5px; line-height:1.7; word-break:break-word}
+.diff-line.old{background:var(--red-soft); color:#8E322B; text-decoration:line-through; text-decoration-color:rgba(194,69,61,.5)}
+.diff-line.new{background:var(--green-soft); color:#2C6B52}
+.diff-tag{display:inline-block; font-size:11px; padding:1px 7px; border-radius:5px; background:var(--line-soft); color:var(--muted); margin-right:7px; text-decoration:none}
+
+/* 变更上下文：法务看的是整句，不是孤立的词 */
+.diff-row{display:grid; grid-template-columns:22px 1fr; gap:8px; margin-top:7px; font-size:12.5px; line-height:1.7}
+.diff-row .rk{font-family:ui-monospace,Consolas,monospace; font-size:11.5px; color:var(--faint); padding-top:1px}
+.diff-row .rv{color:var(--muted); word-break:break-word}
+.diff-row.old .rv{color:#7A3733}
+.diff-row.new .rv{color:#2C6B52}
+.diff-row mark{background:rgba(194,69,61,.16); color:#8E322B; border-radius:3px; padding:0 2px; font-weight:600}
+.diff-row.new mark{background:rgba(62,142,110,.18); color:#2C6B52}
+.hit-tag{font-size:11px; color:var(--faint); font-family:ui-monospace,Consolas,monospace; margin-left:6px; white-space:nowrap}
+
+/* 权限链路 */
+.chain{display:flex; flex-direction:column; gap:4px}
+.chain .node{background:var(--bg); border:1px solid var(--line-soft); border-radius:10px; padding:8px 11px; display:flex; align-items:baseline; justify-content:space-between; gap:10px}
+.chain .node .k{font-size:11px; color:var(--faint)}
+.chain .node .v{font-size:12.5px; font-weight:600; color:var(--ink); font-family:ui-monospace,Consolas,monospace}
+.chain .node.ok .v{color:var(--green)} .chain .node.no .v{color:var(--red)}
+.chain .arrow{text-align:center; color:var(--faint); font-size:11px; line-height:1.1}
+
+/* ---------- 审计 ---------- */
+.audit-head{display:flex; justify-content:space-between; align-items:center; margin-bottom:16px}
+table{width:100%; border-collapse:collapse; font-size:13px}
+th{text-align:left; font-size:11.5px; letter-spacing:.03em; text-transform:uppercase; color:var(--faint); font-weight:600; padding:10px 12px; border-bottom:1px solid var(--line)}
+td{padding:11px 12px; border-bottom:1px solid var(--line-soft); font-family:ui-monospace,Consolas,monospace; font-size:12.5px; color:var(--muted)}
+td.user{color:var(--ink); font-weight:600}
+tr.blocked td{background:var(--red-soft)}
+tr.blocked td.user{color:var(--red)}
+.pill{display:inline-block; font-size:11.5px; padding:2px 9px; border-radius:999px; font-weight:600; font-family:inherit}
+.pill.ok{background:var(--green-soft); color:var(--green)}
+.pill.no{background:var(--red-soft); color:var(--red)}
+
+footer{margin-top:40px; padding-top:20px; border-top:1px solid var(--line); font-size:12.5px; color:var(--faint); line-height:1.8}
+footer b{color:var(--muted); font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <h1>内网敏感数据助手</h1>
+    <p>本地模型直接读原文 · 按身份路由到对应密级 · 审计只记行为</p>
+  </div>
+  <div style="display:flex; align-items:center; gap:18px; flex-wrap:wrap">
+    <div class="status">
+      <span><span class="dot" id="dotOllama"></span>本地模型</span>
+      <span><span class="dot" id="dotGateway"></span>权限网关</span>
+    </div>
+    <div class="who">
+      <label for="identity">身份</label>
+      <select id="identity">
+        <option value="huang">黄文浩</option>
+        <option value="li">李四</option>
+        <option value="guest">访客</option>
+      </select>
+      <span class="dept" id="deptLabel">法务合规部</span>
+    </div>
+  </div>
+</header>
+
+<nav>
+  <button class="on" data-tab="ask"><span class="n">01</span>知识库问答</button>
+  <button data-tab="diff"><span class="n">02</span>合同比对</button>
+  <button data-tab="audit"><span class="n">03</span>审计日志</button>
+</nav>
+
+<!-- ============ 01 问答 ============ -->
+<section id="tab-ask">
+  <div class="ask-grid">
+    <div class="card pad">
+      <div class="sec-title">提问</div>
+      <textarea id="question" placeholder="例如：关联交易审批存在什么问题？"></textarea>
+      <div class="chips" id="chips"></div>
+      <div class="actions">
+        <button class="btn" id="sendBtn">发送问题</button>
+        <span class="hint" id="askHint">本地 7B 模型推理，约 15–25 秒</span>
+      </div>
+      <div class="loading" id="loading"><span class="spinner"></span><span>正在检索并生成回答…</span></div>
+      <div class="alert" id="askAlert"></div>
+
+      <div class="answer" id="answerBox" style="display:none">
+        <div class="answer-head">
+          <span class="pill ok" id="whoTag">黄文浩</span>
+          <span id="tierTag"></span>
+        </div>
+        <div class="answer-body" id="answerText"></div>
+        <div class="answer-meta" id="answerMeta"></div>
+      </div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:16px">
+      <div class="card pad">
+        <div class="sec-title">来源 <span id="srcCount" style="color:var(--faint); font-weight:400"></span></div>
+        <div class="src" id="sources">
+          <div class="empty"><b>还没有回答</b>提问后这里会显示命中的文档与相似度</div>
+        </div>
+      </div>
+
+      <div class="card pad">
+        <div class="sec-title">权限链路</div>
+        <div class="chain">
+          <div class="node"><span class="k">身份</span><span class="v" id="chainWho">黄文浩</span></div>
+          <div class="arrow">↓</div>
+          <div class="node"><span class="k">所属组</span><span class="v" id="chainGroup">compliance</span></div>
+          <div class="arrow">↓</div>
+          <div class="node ok" id="chainTierNode"><span class="k">可访问</span><span class="v" id="chainTier">合规知识库</span></div>
+        </div>
+        <div class="hint" style="margin-top:12px">令牌由网关校验，越权请求在网关层就被拒绝、不会到达模型；审计只记行为，不存问题原文。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 合同比对 ============ -->
+<section id="tab-diff" style="display:none">
+  <div class="card pad" style="margin-bottom:18px">
+    <div class="sec-title">上传两版合同</div>
+    <div class="drop-grid">
+      <label class="drop" id="dropOld">
+        <input type="file" accept="application/pdf" id="fileOld">
+        <div class="ico">▤</div>
+        <div class="t">旧版 PDF</div>
+        <div class="f" data-f>点击选择或拖到这里</div>
+      </label>
+      <label class="drop" id="dropNew">
+        <input type="file" accept="application/pdf" id="fileNew">
+        <div class="ico">▤</div>
+        <div class="t">新版 PDF</div>
+        <div class="f" data-f>点击选择或拖到这里</div>
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn" id="diffBtn" disabled>开始比对</button>
+      <span class="hint">纯本地文本比对，0 模型，通常 0.6 秒内出结果</span>
+    </div>
+    <div class="alert" id="diffAlert"></div>
+  </div>
+
+  <div id="diffResult" style="display:none">
+    <div class="summary" id="diffSummary"></div>
+    <div id="diffWarnings"></div>
+    <div id="diffChanges"></div>
+  </div>
+</section>
+
+<!-- ============ 03 审计 ============ -->
+<section id="tab-audit" style="display:none">
+  <div class="card pad">
+    <div class="audit-head">
+      <div>
+        <div class="sec-title" style="margin:0">行为审计</div>
+        <div class="hint" style="margin-top:4px">只记录谁问了、路由到哪个库、是否被拦、耗时；不存问题原文</div>
+      </div>
+      <button class="btn ghost" id="refreshAudit">刷新</button>
+    </div>
+    <div id="auditBody">
+      <div class="empty"><b>暂无记录</b>去问答页提一个问题，再回来刷新</div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <b>演示说明</b>　港交所公告为真实公开披露文件；员工花名册、内审报告为模拟场景。
+  本地模型 qwen2.5:7b 通过 Ollama 运行，问答数据不出本机；权限网关按身份选择知识库，越权请求在网关层被拒。
+</footer>
+
+</div>
+
+<script>
+/* ================= 公共 ================= */
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const state = { identity: 'huang', dept: '法务合规部' };
+const DEPT = { huang: '法务合规部', li: '人事部', guest: '无' };
+const GROUP = { huang: 'compliance', li: 'hr', guest: '—' };
+const TIER = { huang: '合规知识库', li: '人事知识库', guest: '无' };
+
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+/* 在上下文句子里把变化词标出来；找不到就退回显示原词 */
+function markToken(ctx, token){
+  if (!token) return esc(ctx || '');
+  if (!ctx) return esc(token);
+  const i = ctx.indexOf(token);
+  if (i < 0) return esc(ctx);
+  return esc(ctx.slice(0, i)) + '<mark>' + esc(token) + '</mark>' + esc(ctx.slice(i + token.length));
+}
+
+function fmtSize(b){
+  if (!b) return '0 KB';
+  return b >= 1024 * 1024 ? (b / 1024 / 1024).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+}
+
+function showAlert(el, type, text){
+  el.className = 'alert show ' + type;
+  el.textContent = text;
+}
+function hideAlert(el){ el.className = 'alert'; el.textContent = ''; }
+
+/* ================= Tabs ================= */
+$$('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $$('nav button').forEach(b => b.classList.toggle('on', b === btn));
+    const t = btn.dataset.tab;
+    ['ask','diff','audit'].forEach(k => $('#tab-' + k).style.display = (k === t ? '' : 'none'));
+    if (t === 'audit') loadAudit();
+  });
+});
+
+/* ================= 身份 ================= */
+$('#identity').addEventListener('change', e => {
+  state.identity = e.target.value;
+  state.dept = DEPT[state.identity] || '—';
+  $('#deptLabel').textContent = state.dept;
+  $('#chainWho').textContent = e.target.selectedOptions[0].textContent;
+  $('#chainGroup').textContent = GROUP[state.identity] || '—';
+  $('#chainTier').textContent = TIER[state.identity] || '—';
+  const node = $('#chainTierNode');
+  node.className = 'node ' + (state.identity === 'guest' ? 'no' : 'ok');
+  if (state.identity === 'guest') {
+    showAlert($('#askAlert'), 'warn', '当前是访客身份：没有可访问的知识库，提问会被网关拒绝——这本身就是权限隔离的演示。');
+  } else {
+    hideAlert($('#askAlert'));
+  }
+});
+
+/* ================= 服务状态 ================= */
+async function loadStatus(){
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    $('#dotOllama').className = 'dot ' + (d.ollama ? 'ok' : 'bad');
+    $('#dotGateway').className = 'dot ' + (d.gateway ? 'ok' : 'bad');
+  } catch (e) {
+    $('#dotOllama').className = 'dot bad';
+    $('#dotGateway').className = 'dot bad';
+  }
+}
+
+/* ================= 问答 ================= */
+const EXAMPLES = [
+  '关联交易审批存在什么问题？',
+  '董事会审议关联交易需要什么程序？',
+  '员工年假天数怎么规定？',
+  '合同的付款条件是什么？'
+];
+$('#chips').innerHTML = EXAMPLES.map(q => `<button class="chip">${esc(q)}</button>`).join('');
+$$('#chips .chip').forEach(b => b.addEventListener('click', () => {
+  $('#question').value = b.textContent;
+  $('#question').focus();
+}));
+
+$('#sendBtn').addEventListener('click', ask);
+$('#question').addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') ask();
+});
+
+async function ask(){
+  const q = $('#question').value.trim();
+  if (!q) { showAlert($('#askAlert'), 'warn', '先写一个问题。'); return; }
+  hideAlert($('#askAlert'));
+  $('#answerBox').style.display = 'none';
+  $('#loading').classList.add('show');
+  $('#sendBtn').disabled = true;
+  $('#sources').innerHTML = '<div class="empty"><b>检索中</b>正在找命中的条款</div>';
+  $('#srcCount').textContent = '';
+
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q, identity: state.identity })
+    });
+    const d = await r.json();
+
+    if (!d.ok) {
+      showAlert($('#askAlert'), 'err', d.error || '请求失败');
+      $('#sources').innerHTML = '<div class="empty"><b>没有结果</b>请求被拒绝或失败</div>';
+      return;
+    }
+
+    $('#answerText').textContent = d.answer || '（空回答）';
+    $('#whoTag').textContent = d.who || state.identity;
+    $('#tierTag').textContent = d.tier ? ('路由：' + d.tier) : ('部门：' + (state.dept || '—'));
+    const secs = ((d.latency_ms || (performance.now() - t0)) / 1000).toFixed(1);
+    $('#answerMeta').innerHTML =
+      `<span>耗时 ${secs}s</span><span>来源 ${(d.sources || []).length} 条</span><span>身份 ${esc(d.who || '')}</span>`;
+    $('#answerBox').style.display = '';
+
+    const srcs = d.sources || [];
+    // 同一文档可能命中多段：按文档聚合，取最高分，标出命中段数
+    const grouped = new Map();
+    srcs.forEach(s => {
+      const doc = s.doc || '未知文档';
+      const cur = grouped.get(doc) || { doc, score: 0, hits: 0 };
+      cur.hits += 1;
+      if ((s.score || 0) > cur.score) cur.score = s.score || 0;
+      grouped.set(doc, cur);
+    });
+    const list = Array.from(grouped.values()).sort((a, b) => b.score - a.score);
+    $('#srcCount').textContent = list.length ? `（${srcs.length} 段 / ${list.length} 篇）` : '';
+    if (!list.length) {
+      $('#sources').innerHTML = '<div class="empty"><b>没有来源</b>这次回答没有命中任何文档</div>';
+    } else {
+      $('#sources').innerHTML = list.map(s => {
+        const pct = Math.round((s.score || 0) * 100);
+        const cls = pct >= 70 ? '' : (pct >= 50 ? 'mid' : 'low');
+        return `<div class="src-item">
+          <div class="src-top">
+            <span class="src-name">${esc(s.doc)}${s.hits > 1 ? `<span class="hit-tag">命中 ${s.hits} 段</span>` : ''}</span>
+            <span class="src-score">${(s.score || 0).toFixed(3)}</span>
+          </div>
+          <div class="bar"><i class="${cls}" style="width:${pct}%"></i></div>
+        </div>`;
+      }).join('');
+    }
+  } catch (e) {
+    showAlert($('#askAlert'), 'err', '请求失败：' + e.message);
+  } finally {
+    $('#loading').classList.remove('show');
+    $('#sendBtn').disabled = false;
+  }
+}
+
+/* ================= 合同比对 ================= */
+const files = { old: null, new: null };
+function bindDrop(dropId, inputId, key){
+  const drop = $(dropId), input = $(inputId);
+  const label = drop.querySelector('[data-f]');
+  input.addEventListener('change', () => setFile(key, input.files[0], drop, label));
+  ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => {
+    const f = e.dataTransfer.files[0];
+    if (f) { input.files = e.dataTransfer.files; setFile(key, f, drop, label); }
+  });
+}
+function setFile(key, f, drop, label){
+  if (!f) return;
+  if (!/\.pdf$/i.test(f.name)) {
+    showAlert($('#diffAlert'), 'warn', '只支持 PDF；扫描件/图片型 PDF 解析不出文字。');
+    return;
+  }
+  files[key] = f;
+  drop.classList.add('has');
+  label.textContent = f.name + ' · ' + fmtSize(f.size);
+  $('#diffBtn').disabled = !(files.old && files.new);
+  hideAlert($('#diffAlert'));
+}
+bindDrop('#dropOld', '#fileOld', 'old');
+bindDrop('#dropNew', '#fileNew', 'new');
+
+$('#diffBtn').addEventListener('click', async () => {
+  if (!files.old || !files.new) return;
+  hideAlert($('#diffAlert'));
+  $('#diffBtn').disabled = true;
+  $('#diffBtn').textContent = '比对中…';
+  try {
+    const fd = new FormData();
+    fd.append('old_file', files.old);
+    fd.append('new_file', files.new);
+    const r = await fetch('/api/diff', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (d.error) { showAlert($('#diffAlert'), 'err', d.error); return; }
+    renderDiff(d);
+  } catch (e) {
+    showAlert($('#diffAlert'), 'err', '比对失败：' + e.message);
+  } finally {
+    $('#diffBtn').disabled = false;
+    $('#diffBtn').textContent = '开始比对';
+  }
+});
+
+function renderDiff(d){
+  const s = d.summary || {};
+  const items = [
+    { k: '条款数', v: `${s.clauses_a ?? '—'} → ${s.clauses_b ?? '—'}`, c: '' },
+    { k: '内容变更', v: s.changed ?? 0, c: '' },
+    { k: '关键变更', v: s.critical ?? 0, c: (s.critical ? 'red' : 'green') },
+    { k: '新增 / 删除', v: `${s.added ?? 0} / ${s.removed ?? 0}`, c: '' },
+    { k: '耗时', v: ((d.elapsed_ms || 0) / 1000).toFixed(2) + 's', c: '' }
+  ];
+  $('#diffSummary').innerHTML = items.map(i =>
+    `<div class="stat"><div class="k">${i.k}</div><div class="v ${i.c}">${esc(i.v)}</div></div>`
+  ).join('');
+
+  const warns = (d.warnings || []);
+  $('#diffWarnings').innerHTML = warns.length
+    ? `<div class="alert show warn" style="margin:0 0 16px">${warns.map(w => esc(w)).join('<br>')}</div>` : '';
+
+  const changes = d.changes || [];
+  $('#diffChanges').innerHTML = changes.length ? changes.map((c, i) => {
+    const cls = c.type === '新增' ? 'add' : (c.type === '删除' ? 'del' : (c.type === '仅编号变更' ? 'num' : 'mod'));
+    const diffs = (c.diffs || []).slice(0, 6).map((x, di) => {
+      if (x.kind === 'renumber') {
+        return `<div class="diff-row"><span class="rk">编号</span><span class="rv">${esc(x.old)} → ${esc(x.new)}</span></div>`;
+      }
+      const ctx = x.context || '';
+      const [co, cn] = ctx.includes(' … ') ? ctx.split(' … ') : ['', ''];
+      // 同一条款有多处改动时，只有第一处展开完整上下文，其余只给变化词，避免整句重复
+      if (di === 0 && (co || cn)) {
+        const oldRow = (x.old || co) ? `<div class="diff-row old"><span class="rk">旧</span><span class="rv">${markToken(co, x.old)}</span></div>` : '';
+        const newRow = (x.new || cn) ? `<div class="diff-row new"><span class="rk">新</span><span class="rv">${markToken(cn, x.new)}</span></div>` : '';
+        return oldRow + newRow;
+      }
+      if (x.old || x.new) {
+        return `<div class="diff-row"><span class="rk">改</span><span class="rv">${esc(x.old || '（空）')} → <b>${esc(x.new || '（删除）')}</b></span></div>`;
+      }
+      return '';
+    }).join('');
+    return `<div class="change ${c.critical ? 'crit' : ''}">
+      <div class="ch-head" data-i="${i}">
+        <span class="ch-id">${esc(c.clause || '—')}</span>
+        <span class="ch-title">${esc(c.title || '')}</span>
+        ${c.critical ? '<span class="badge crit">关键</span>' : ''}
+        <span class="badge ${cls}">${esc(c.type)}</span>
+      </div>
+      <div class="ch-body" id="chb-${i}">${diffs || '<div class="hint">没有可展示的字符级差异</div>'}</div>
+    </div>`;
+  }).join('') : '<div class="card"><div class="empty"><b>两版内容一致</b>没有检测到条款级改动</div></div>';
+
+  $$('#diffChanges .ch-head').forEach(h => h.addEventListener('click', () => {
+    const b = $('#chb-' + h.dataset.i);
+    if (b) b.classList.toggle('open');
+  }));
+  // 默认展开关键变更
+  changes.forEach((c, i) => { if (c.critical) $('#chb-' + i)?.classList.add('open'); });
+
+  $('#diffResult').style.display = '';
+}
+
+/* ================= 审计 ================= */
+async function loadAudit(){
+  const box = $('#auditBody');
+  box.innerHTML = '<div class="empty"><b>加载中</b>正在读网关审计库</div>';
+  try {
+    const r = await fetch('/api/audit?limit=50');
+    const d = await r.json();
+    if (!d.ok) { box.innerHTML = `<div class="empty"><b>读取失败</b>${esc(d.error || '')}</div>`; return; }
+    const rows = d.records || [];
+    if (!rows.length) { box.innerHTML = '<div class="empty"><b>暂无记录</b>去问答页提一个问题</div>'; return; }
+    box.innerHTML = `<div style="overflow:auto"><table>
+      <thead><tr><th>时间</th><th>用户</th><th>组</th><th>路由</th><th>结果</th><th>耗时</th></tr></thead>
+      <tbody>${rows.map(r => `<tr class="${r.blocked ? 'blocked' : ''}">
+        <td>${esc(r.ts)}</td>
+        <td class="user">${esc(r.user || '-')}</td>
+        <td>${esc(r.groups || '—')}</td>
+        <td>${esc(r.routed || '—')}</td>
+        <td>${r.blocked ? '<span class="pill no">拦截</span>' : '<span class="pill ok">放行</span>'}</td>
+        <td>${r.ms ? (r.ms / 1000).toFixed(1) + 's' : '—'}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty"><b>读取失败</b>${esc(e.message)}</div>`;
+  }
+}
+$('#refreshAudit').addEventListener('click', loadAudit);
+
+/* ================= 初始化 ================= */
+loadStatus();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

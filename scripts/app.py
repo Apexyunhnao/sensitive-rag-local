@@ -47,10 +47,10 @@ PORT = 8092
 IDENTITIES = {
     "huang": {"name": "黄文浩", "dept": "法务合规部", "groups": ["compliance"],
               "token": "token-huang-compliance"},
-    "zhang": {"name": "张三", "dept": "人事部", "groups": ["hr"],
-              "token": "token-zhang-hr"},
+    "li": {"name": "李四", "dept": "人事部", "groups": ["hr"],
+           "token": "tk-li-9e2c5d7b"},
     "guest": {"name": "访客", "dept": "无", "groups": [],
-              "token": "token-guest-none"},
+              "token": "tk-guest-1a3f8e4c"},
 }
 
 app = FastAPI(title="本地敏感数据 AI 助手")
@@ -460,6 +460,18 @@ async def api_diff_by_path(payload: dict) -> JSONResponse:
             {"error": "路径无效：文件不存在、不是 PDF，或不在允许的目录内"},
             status_code=400)
     return _diff_files(pa, pb, pa.name, pb.name)
+
+
+@app.get("/api/audit")
+def api_audit(limit: int = 100) -> dict:
+    """审计日志代理：只返回行为记录（谁问了、路由到哪个库、是否被拦、耗时），不含问题原文。"""
+    try:
+        with urllib.request.urlopen(f"{GATEWAY}/audit", timeout=5) as r:
+            data = json.loads(r.read().decode())
+        records = data.get("records", [])[:limit]
+        return {"ok": True, "count": len(records), "records": records}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"网关不可达：{e}", "records": []}
 
 
 @app.get("/api/skills")
